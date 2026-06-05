@@ -165,6 +165,28 @@ export function Router() {
             </div>
           </div>
         </div>
+        <div className="space-y-2 border-t pt-3">
+          <Label className="text-xs text-muted-foreground">Reasoning Flash (simple MCP relay)</Label>
+          <Combobox
+            options={modelOptions}
+            value={routerConfig.reasoningFlash || ""}
+            onChange={(value) => handleRouterChange("reasoningFlash", value)}
+            placeholder={t("router.selectModel")}
+            searchPlaceholder={t("router.searchModel")}
+            emptyPlaceholder={t("router.noModelFound")}
+          />
+        </div>
+        <div className="space-y-2">
+          <Label className="text-xs text-muted-foreground">Reasoning Pro Max (deep reasoning)</Label>
+          <Combobox
+            options={modelOptions}
+            value={routerConfig.reasoningProMax || ""}
+            onChange={(value) => handleRouterChange("reasoningProMax", value)}
+            placeholder={t("router.selectModel")}
+            searchPlaceholder={t("router.searchModel")}
+            emptyPlaceholder={t("router.noModelFound")}
+          />
+        </div>
       </CardContent>
     </Card>
   );

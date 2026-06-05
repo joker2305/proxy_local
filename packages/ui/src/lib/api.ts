@@ -169,50 +169,37 @@ class ApiClient {
 
   // Get providers
   async getProviders(): Promise<Provider[]> {
-    return this.get<Provider[]>('/api/providers');
+    return this.get<Provider[]>('/providers');
   }
 
-  // Add a new provider
   async addProvider(provider: Provider): Promise<Provider> {
-    return this.post<Provider>('/api/providers', provider);
+    return this.post<Provider>('/providers', provider);
   }
 
-  // Update a provider
   async updateProvider(index: number, provider: Provider): Promise<Provider> {
-    return this.post<Provider>(`/api/providers/${index}`, provider);
+    return this.post<Provider>(`/providers/${index}`, provider);
   }
 
-  // Delete a provider
   async deleteProvider(index: number): Promise<void> {
-    return this.delete<void>(`/api/providers/${index}`);
+    return this.delete<void>(`/providers/${index}`);
   }
 
-  // Get transformers
   async getTransformers(): Promise<Transformer[]> {
-    return this.get<Transformer[]>('/api/transformers');
+    return this.get<Transformer[]>('/transformers');
   }
 
-  // Add a new transformer
   async addTransformer(transformer: Transformer): Promise<Transformer> {
-    return this.post<Transformer>('/api/transformers', transformer);
+    return this.post<Transformer>('/transformers', transformer);
   }
 
-  // Update a transformer
   async updateTransformer(index: number, transformer: Transformer): Promise<Transformer> {
-    return this.post<Transformer>(`/api/transformers/${index}`, transformer);
+    return this.post<Transformer>(`/transformers/${index}`, transformer);
   }
 
-  // Delete a transformer
   async deleteTransformer(index: number): Promise<void> {
-    return this.delete<void>(`/api/transformers/${index}`);
+    return this.delete<void>(`/transformers/${index}`);
   }
 
-  // Get configuration (new endpoint)
-  async getConfigNew(): Promise<Config> {
-    return this.get<Config>('/config');
-  }
-
-  // Save configuration (new endpoint)
   async saveConfig(config: Config): Promise<unknown> {
     return this.post<Config>('/config', config);
   }

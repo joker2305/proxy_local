@@ -11,6 +11,9 @@ import { resolveModelAlias } from "./model-alias";
 import { analyzeReasoning, buildContextInjection } from "../engines/reasoning-engine";
 import { getAdaptiveRouter } from "./adaptive-router";
 import { getAdaptiveParameterTuner } from "./adaptive-params";
+import { classifyRequest, extractLastUserMessage } from "./task-classifier";
+import type { TaskTier, TaskCategory } from "./task-classifier";
+import { getThinkingStrategyManager } from "./thinking-strategy";
 
 // ==========================================================================
 // Provider fallback: config-driven via "fallback" section in config.json
@@ -226,6 +229,56 @@ const getUseModel = async (
     req.log.info(`Using think model for ${req.body.thinking}`);
     return { model: Router.think, scenarioType: 'think' };
   }
+
+  // ====================================================================
+  // TASK CLASSIFICATION + STRATEGY SELECTION
+  // Classify the request difficulty and select the optimal model
+  // using the thinking strategy system. This allows DeepSeek V4 Pro
+  // to be actively selected for complex reasoning (not just fallback).
+  // ====================================================================
+  const taskClassificationEnabled = configService.get<boolean>('taskClassification') !== false;
+  if (taskClassificationEnabled) {
+    try {
+      const lastMessage = extractLastUserMessage(req.body);
+      if (lastMessage.length > 0) {
+        const classification = classifyRequest(lastMessage, undefined, tokenCount);
+        (req as any)._taskClassification = classification;
+
+        if (classification.confidence >= 0.55) {
+          const strategyManager = getThinkingStrategyManager(req.log);
+          const providers = configService.get<any[]>('providers') || [];
+          strategyManager.updateAvailableProviders(providers);
+
+          const selection = strategyManager.selectStrategy(
+            classification.tier,
+            classification.category,
+            tokenCount,
+          );
+
+          // Apply strategy params (thinking config, temperature, etc.)
+          req.body = strategyManager.applyParams(req.body, selection.strategy);
+
+          req.log.info(
+            `TaskClassifier: ${classification.tier}/${classification.category} ` +
+            `(score=${classification.score.toFixed(3)}, conf=${classification.confidence.toFixed(2)}) ` +
+            `→ ${selection.strategy.name} (${selection.model}) ` +
+            `reason: ${selection.reason}`
+          );
+
+          (req as any)._strategySelection = selection;
+          return { model: selection.model, scenarioType: 'strategy_selected' };
+        }
+
+        req.log.debug(
+          `TaskClassifier: ${classification.tier}/${classification.category} ` +
+          `low confidence (${classification.confidence.toFixed(2)}), skipping strategy selection`
+        );
+      }
+    } catch (e: any) {
+      req.log.debug(`TaskClassifier skipped: ${e.message}`);
+    }
+  }
+
   return { model: Router?.default, scenarioType: 'default' };
 };
 
@@ -263,6 +316,11 @@ export type RouterScenarioType =
   | 'think'
   | 'longContext'
   | 'webSearch'
+  | 'reasoning_flash'
+  | 'reasoning_pro_max'
+  | 'strategy_selected'
+  | 'health_fallback'
+  | 'adaptive'
   | string;
 
 export interface RouterFallbackConfig {

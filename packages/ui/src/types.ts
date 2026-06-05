@@ -19,6 +19,8 @@ export interface RouterConfig {
     longContextThreshold: number;
     webSearch: string;
     image: string;
+    reasoningFlash?: string;
+    reasoningProMax?: string;
     custom?: any;
 }
 
