@@ -5,6 +5,7 @@ import { Router } from "@/components/Router";
 import { Transformers } from "@/components/Transformers";
 import { ModelMapping } from "@/components/ModelMapping";
 import { ThinkingStrategy } from "@/components/ThinkingStrategy";
+import { RAGManager } from "@/components/RAGManager";
 import { ViewTabs, type ViewName } from "@/components/ViewTabs";
 import { Dashboard } from "@/components/Dashboard";
 import { CacheManager } from "@/components/CacheManager";
@@ -115,12 +116,15 @@ function App() {
         );
       case 'tools':
         return (
-          <div className="flex h-full gap-4">
-            <div className="w-1/2 min-w-0">
-              <ModelMapping />
-            </div>
-            <div className="w-1/2 min-w-0">
-              <ThinkingStrategy />
+          <div className="flex h-full flex-col gap-4">
+            <div className="flex gap-4 flex-1 min-h-0">
+              <div className="w-1/2 min-w-0 flex flex-col gap-4">
+                <ModelMapping />
+                <ThinkingStrategy />
+              </div>
+              <div className="w-1/2 min-w-0 flex flex-col gap-4">
+                <RAGManager />
+              </div>
             </div>
           </div>
         );
