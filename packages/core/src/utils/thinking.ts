@@ -42,25 +42,31 @@ export function parseThinkingConfig(thinking: any): {
   };
 }
 
-export function thinkingToOpenAI(config: ReturnType<typeof parseThinkingConfig>): {
+export function thinkingToOpenAI(config: ReturnType<typeof parseThinkingConfig>, model?: string): {
   reasoning?: { effort: string };
   thinking?: { type: string };
 } | {} {
   if (!config.enabled) return {};
+  const isDeepseekV4Pro = model && /deepseek-(v4-pro|reasoner)/.test(model);
   const effortMap: Record<ThinkLevel, string> = {
     none: "none",
     low: "low",
     medium: "medium",
-    high: "high",
+    high: isDeepseekV4Pro ? "max" : "high",
   };
   return { reasoning: { effort: effortMap[config.level] || "medium" } };
 }
 
-export function thinkingToGlm(config: ReturnType<typeof parseThinkingConfig>): {
-  thinking?: { type: "enabled" };
+export function thinkingToGlm(config: ReturnType<typeof parseThinkingConfig>, model?: string): {
+  thinking?: { type: string; clear_thinking?: boolean };
 } | {} {
   if (!config.enabled) return {};
-  return { thinking: { type: "enabled" } } as any;
+  const isCodingModel = model && /^glm-5(\.1)?$/.test(model);
+  const result: any = { thinking: { type: 'enabled' } };
+  if (isCodingModel) {
+    result.thinking.clear_thinking = false;
+  }
+  return result;
 }
 
 export function thinkingToAnthropic(config: ReturnType<typeof parseThinkingConfig>): {

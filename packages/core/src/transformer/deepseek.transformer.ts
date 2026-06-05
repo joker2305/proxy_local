@@ -1,13 +1,72 @@
 import { UnifiedChatRequest } from "../types/llm";
 import { Transformer } from "../types/transformer";
 
+const DEEPSEEK_V4_PRO_MODELS = ['deepseek-v4-pro', 'deepseek-reasoner'];
+const DEEPSEEK_V4_FLASH_MODELS = ['deepseek-v4-flash', 'deepseek-chat'];
+
+function isDeepseekV4Pro(model: string): boolean {
+  return DEEPSEEK_V4_PRO_MODELS.some(m => model.includes(m));
+}
+
+function isDeepseekV4Flash(model: string): boolean {
+  return DEEPSEEK_V4_FLASH_MODELS.some(m => model.includes(m));
+}
+
+function isDeepseekThinkingModel(model: string): boolean {
+  return isDeepseekV4Pro(model) || isDeepseekV4Flash(model);
+}
+
 export class DeepseekTransformer implements Transformer {
   name = "deepseek";
 
   async transformRequestIn(request: UnifiedChatRequest): Promise<UnifiedChatRequest> {
-    if (request.max_tokens && request.max_tokens > 64000) {
-      request.max_tokens = 64000;
+    const model = request.model || '';
+
+    if (isDeepseekV4Pro(model)) {
+      if (request.max_tokens && request.max_tokens > 384000) {
+        request.max_tokens = 384000;
+      }
+
+      if (request.reasoning?.enabled !== false) {
+        (request as any).thinking = { type: 'enabled' };
+        delete request.temperature;
+        delete request.top_p;
+        delete request.presence_penalty;
+        delete request.frequency_penalty;
+
+        const effort = (request as any).reasoning_effort
+          || (request.reasoning?.max_tokens && request.reasoning.max_tokens > 32000 ? 'max' : undefined)
+          || 'max';
+        (request as any).reasoning_effort = effort;
+      } else {
+        (request as any).thinking = { type: 'disabled' };
+      }
+
+      delete request.reasoning;
+    } else if (isDeepseekV4Flash(model)) {
+      if (request.max_tokens && request.max_tokens > 384000) {
+        request.max_tokens = 384000;
+      }
+
+      if (request.reasoning?.enabled) {
+        (request as any).thinking = { type: 'enabled' };
+        delete request.temperature;
+        delete request.top_p;
+        delete request.presence_penalty;
+        delete request.frequency_penalty;
+      } else if ((request as any).reasoning_effort) {
+        (request as any).thinking = { type: 'enabled' };
+        delete request.temperature;
+        delete request.top_p;
+      }
+
+      delete request.reasoning;
+    } else {
+      if (request.max_tokens && request.max_tokens > 64000) {
+        request.max_tokens = 64000;
+      }
     }
+
     return request;
   }
 
@@ -17,31 +76,23 @@ export class DeepseekTransformer implements Transformer {
       const msg = jsonResponse?.choices?.[0]?.message;
 
       if (!response.ok) {
-        // Upstream error — pass through as-is so error handler can process it
         return new Response(JSON.stringify(jsonResponse), {
           status: response.status,
           statusText: response.statusText,
           headers: response.headers,
         });
       }
-      
-      // Map DeepSeek's reasoning_content to thinking block for non-streaming responses.
-      // When reasoning_content is present alongside content, reasoning_content goes to thinking
-      // and content stays as the actual response text.
+
       if (msg?.reasoning_content) {
         if (!msg.thinking) {
           msg.thinking = { content: msg.reasoning_content };
         }
         delete msg.reasoning_content;
 
-        // If content is empty after moving reasoning_content to thinking, this was a
-        // reasoning-only response (v4-flash sometimes does this) — keep content empty
-        // and let downstream AnthropicTransformer handle it.
         if (!msg.content || msg.content === "") {
-          console.log(`[DeepseekTransformer] Non-streaming: reasoning_content (${msg.thinking.content.length} chars) -> thinking block`);
+          console.log(`[DeepseekTransformer] reasoning-only response (${msg.thinking.content.length} chars)`);
         }
       }
-      console.log(`[DeepseekTransformer] Non-streaming: content="${String(msg?.content).substring(0, 50)}", hasThinking=${!!msg?.thinking}, model=${jsonResponse?.model}`);
 
       return new Response(JSON.stringify(jsonResponse), {
         status: response.status,

@@ -55,7 +55,6 @@ export interface Config {
   transformers: Transformer[];
   StatusLine?: StatusLineConfig;
   forceUseImageAgent?: boolean;
-  // Top-level settings
   LOG: boolean;
   LOG_LEVEL: string;
   CLAUDE_PATH: string;
@@ -65,6 +64,10 @@ export interface Config {
   API_TIMEOUT_MS: string;
   PROXY_URL: string;
   CUSTOM_ROUTER_PATH?: string;
+  ModelMapping?: Record<string, string>;
+  fallback?: Record<string, string[]>;
+  Concurrency?: any;
+  [key: string]: any;
 }
 
 export type AccessLevel = 'restricted' | 'full';

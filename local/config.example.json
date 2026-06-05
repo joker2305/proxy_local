@@ -6,84 +6,56 @@
   "LOG_LEVEL": "info",
   "API_TIMEOUT_MS": 600000,
 
-  "_comment": "Pluggable provider architecture: add any OpenAI/Anthropic/Gemini compatible provider below. No provider-specific hardcoding.",
-
   "Providers": [
-    {
-      "name": "openai",
-      "api_base_url": "https://api.openai.com/v1/chat/completions",
-      "api_key": "${OPENAI_API_KEY}",
-      "models": ["gpt-4o", "gpt-4o-mini", "o1", "o3-mini"],
-      "transformer": {
-        "use": ["openai"],
-        "o1": { "use": ["openai", "reasoning"] },
-        "o3-mini": { "use": ["openai", "reasoning"] }
-      }
-    },
     {
       "name": "deepseek",
       "api_base_url": "https://api.deepseek.com/chat/completions",
       "api_key": "${DEEPSEEK_API_KEY}",
-      "models": ["deepseek-chat", "deepseek-reasoner"],
+      "models": ["deepseek-v4-pro", "deepseek-v4-flash"],
       "transformer": {
         "use": ["deepseek"],
-        "deepseek-reasoner": { "use": ["deepseek", "reasoning"] }
-      }
-    },
-    {
-      "name": "gemini",
-      "api_base_url": "https://generativelanguage.googleapis.com/v1beta",
-      "api_key": "${GEMINI_API_KEY}",
-      "models": ["gemini-2.5-pro", "gemini-2.5-flash"],
-      "transformer": { "use": ["gemini"] }
-    },
-    {
-      "name": "ollama",
-      "api_base_url": "http://localhost:11434/v1/chat/completions",
-      "api_key": "ollama",
-      "models": ["qwen2.5-coder:7b", "deepseek-coder-v2:16b"],
-      "transformer": { "use": ["openai"] }
+        "deepseek-v4-pro": { "use": ["deepseek"] },
+        "deepseek-v4-flash": { "use": ["deepseek"] }
+      },
+      "priority": 1
     }
   ],
 
   "Router": {
-    "default": "openai,gpt-4o",
-    "background": "openai,gpt-4o-mini",
-    "think": "deepseek,deepseek-reasoner",
-    "longContext": "openai,gpt-4o",
+    "default": "deepseek,deepseek-v4-pro",
+    "background": "deepseek,deepseek-v4-flash",
+    "think": "deepseek,deepseek-v4-pro",
+    "longContext": "deepseek,deepseek-v4-pro",
     "longContextThreshold": 60000,
-    "reasoningFlash": "openai,gpt-4o-mini",
-    "reasoningProMax": "deepseek,deepseek-reasoner"
+    "reasoningFlash": "deepseek,deepseek-v4-flash",
+    "reasoningProMax": "deepseek,deepseek-v4-pro"
   },
 
   "ModelMapping": {
-    "claude-opus-4-6": "deepseek,deepseek-reasoner",
-    "claude-opus-4-20250514": "deepseek,deepseek-reasoner",
-    "claude-opus-4": "deepseek,deepseek-reasoner",
-    "opus": "deepseek,deepseek-reasoner",
-    "claude-sonnet-4-6": "openai,gpt-4o",
-    "claude-sonnet-4-20250514": "openai,gpt-4o",
-    "claude-sonnet-4": "openai,gpt-4o",
-    "sonnet": "openai,gpt-4o",
-    "claude-haiku-4-5-20251213": "openai,gpt-4o-mini",
-    "claude-haiku-4-5": "openai,gpt-4o-mini",
-    "haiku": "openai,gpt-4o-mini"
+    "claude-opus-4-6": "deepseek,deepseek-v4-pro",
+    "claude-opus-4-20250514": "deepseek,deepseek-v4-pro",
+    "claude-opus-4": "deepseek,deepseek-v4-pro",
+    "opus": "deepseek,deepseek-v4-pro",
+    "claude-sonnet-4-6": "deepseek,deepseek-v4-flash",
+    "claude-sonnet-4-20250514": "deepseek,deepseek-v4-flash",
+    "claude-sonnet-4": "deepseek,deepseek-v4-flash",
+    "sonnet": "deepseek,deepseek-v4-flash",
+    "claude-haiku-4-5-20251213": "deepseek,deepseek-v4-flash",
+    "claude-haiku-4-5": "deepseek,deepseek-v4-flash",
+    "haiku": "deepseek,deepseek-v4-flash"
   },
 
   "Concurrency": {
     "global": 10,
     "providers": {
-      "openai": 5,
-      "deepseek": 5,
-      "gemini": 3,
-      "ollama": 2
+      "deepseek": 5
     },
     "queueTimeoutMs": 120000
   },
 
   "fallback": {
-    "default": ["deepseek,deepseek-chat"],
-    "think": ["openai,gpt-4o"],
-    "longContext": ["deepseek,deepseek-reasoner"]
+    "default": ["deepseek,deepseek-v4-flash"],
+    "think": ["deepseek,deepseek-v4-flash"],
+    "longContext": ["deepseek,deepseek-v4-flash"]
   }
 }

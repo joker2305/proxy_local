@@ -27,6 +27,10 @@ const BUILTIN_ALIASES: Record<string, string> = {
   'glm-5': 'glm-5.1',
   'glm-4': 'glm-4.7',
   'chatglm': 'glm-5.1',
+  'deepseek-pro': 'deepseek-v4-pro',
+  'deepseek-flash': 'deepseek-v4-flash',
+  'ds-pro': 'deepseek-v4-pro',
+  'ds-flash': 'deepseek-v4-flash',
 };
 
 /**

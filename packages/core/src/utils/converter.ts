@@ -20,8 +20,9 @@ function log(...args: any[]) {
 function sanitizeReasoningModelParams(body: any, targetModel: string): void {
   const isReasoningModel = /^(o1-|o3-|o4-|grok-3-mini|qwen-qwq)/.test(targetModel);
   const isGPT5 = /^gpt-5/.test(targetModel);
+  const isDeepseekThinking = /^deepseek-(v4-pro|reasoner)/.test(targetModel);
 
-  if (isReasoningModel) {
+  if (isReasoningModel || isDeepseekThinking) {
     delete body.temperature;
     delete body.top_p;
     delete body.frequency_penalty;

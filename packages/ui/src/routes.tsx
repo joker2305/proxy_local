@@ -1,6 +1,5 @@
-import { createMemoryRouter, Navigate } from 'react-router-dom';
+import { createMemoryRouter } from 'react-router-dom';
 import App from './App';
-import { Login } from '@/components/Login';
 import { DebugPage } from '@/components/DebugPage';
 import { Presets } from '@/components/Presets';
 import { Dashboard } from '@/components/Dashboard';
@@ -8,55 +7,40 @@ import { CacheManager } from '@/components/CacheManager';
 import { BudgetTracker } from '@/components/BudgetTracker';
 import { Pipeline } from '@/components/Pipeline';
 import { ProviderMonitor } from '@/components/ProviderMonitor';
-import { SetupWizard } from '@/components/SetupWizard';
-import ProtectedRoute from '@/components/ProtectedRoute';
-import PublicRoute from '@/components/PublicRoute';
 
 export const router = createMemoryRouter([
   {
     path: '/',
-    element: <Navigate to="/dashboard" replace />,
-  },
-  {
-    path: '/setup',
-    element: <SetupWizard />,
-  },
-  {
-    path: '/login',
-    element: <PublicRoute><Login /></PublicRoute>,
-  },
-  {
-    path: '/dashboard',
-    element: <ProtectedRoute><App /></ProtectedRoute>,
+    element: <App />,
   },
   {
     path: '/presets',
-    element: <ProtectedRoute><Presets /></ProtectedRoute>,
+    element: <Presets />,
   },
   {
     path: '/debug',
-    element: <ProtectedRoute><DebugPage /></ProtectedRoute>,
+    element: <DebugPage />,
   },
   {
     path: '/monitoring',
-    element: <ProtectedRoute><Dashboard /></ProtectedRoute>,
+    element: <Dashboard />,
   },
   {
     path: '/cache',
-    element: <ProtectedRoute><CacheManager /></ProtectedRoute>,
+    element: <CacheManager />,
   },
   {
     path: '/budget',
-    element: <ProtectedRoute><BudgetTracker /></ProtectedRoute>,
+    element: <BudgetTracker />,
   },
   {
     path: '/pipeline',
-    element: <ProtectedRoute><Pipeline /></ProtectedRoute>,
+    element: <Pipeline />,
   },
   {
     path: '/providers-monitor',
-    element: <ProtectedRoute><ProviderMonitor /></ProtectedRoute>,
+    element: <ProviderMonitor />,
   },
 ], {
-  initialEntries: ['/dashboard']
+  initialEntries: ['/']
 });

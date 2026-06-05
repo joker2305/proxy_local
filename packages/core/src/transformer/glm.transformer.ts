@@ -1,16 +1,52 @@
 import { UnifiedChatRequest } from "../types/llm";
 import { Transformer } from "../types/transformer";
 
+const GLM_THINKING_MODELS = ['glm-5.1', 'glm-5', 'glm-5-turbo', 'glm-4.7'];
+const GLM_CODING_PLAN_MODELS = ['glm-5.1', 'glm-5'];
+
+function isGlmThinkingModel(model: string): boolean {
+  return GLM_THINKING_MODELS.some(m => model.startsWith(m));
+}
+
+function isGlmCodingPlanModel(model: string): boolean {
+  return GLM_CODING_PLAN_MODELS.some(m => model === m || model.startsWith(m + '-'));
+}
+
 export class GlmTransformer implements Transformer {
   name = "glm";
 
   async transformRequestIn(request: UnifiedChatRequest): Promise<UnifiedChatRequest> {
+    const model = request.model || '';
+
     if (request.max_tokens && request.max_tokens > 128000) {
       request.max_tokens = 128000;
     }
 
     if (request.stream && request.tools && request.tools.length > 0) {
       (request as any).tool_stream = true;
+    }
+
+    if (isGlmThinkingModel(model)) {
+      if (request.reasoning?.enabled !== false && !(request as any).thinking) {
+        const thinkConfig: any = { type: 'enabled' };
+
+        if (isGlmCodingPlanModel(model)) {
+          thinkConfig.clear_thinking = false;
+        }
+
+        (request as any).thinking = thinkConfig;
+      } else if ((request as any).thinking?.type === 'enabled') {
+        if (isGlmCodingPlanModel(model)) {
+          (request as any).thinking.clear_thinking = false;
+        }
+      }
+
+      if (request.temperature === undefined && request.reasoning?.enabled !== false) {
+        (request as any).temperature = 1.0;
+        (request as any).do_sample = true;
+      }
+
+      delete request.reasoning;
     }
 
     return request;
@@ -36,10 +72,9 @@ export class GlmTransformer implements Transformer {
         delete msg.reasoning_content;
 
         if (!msg.content || msg.content === "") {
-          console.log(`[GlmTransformer] Non-streaming: reasoning_content (${msg.thinking.content.length} chars) -> thinking block`);
+          console.log(`[GlmTransformer] reasoning-only response (${msg.thinking.content.length} chars)`);
         }
       }
-      console.log(`[GlmTransformer] Non-streaming: content="${String(msg?.content).substring(0, 50)}", hasThinking=${!!msg?.thinking}, model=${jsonResponse?.model}`);
 
       return new Response(JSON.stringify(jsonResponse), {
         status: response.status,
