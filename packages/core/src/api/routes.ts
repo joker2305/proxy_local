@@ -874,8 +874,8 @@ export const registerApiRoutes = async (
   });
 
   // Health and info endpoints
-  fastify.get("/", async () => {
-    return { message: "LLMs API", version };
+  fastify.get("/", async (req: any, reply: any) => {
+    reply.redirect("/ui/");
   });
 
   fastify.get("/health", async () => {
