@@ -1965,7 +1965,7 @@ export const registerApiRoutes = async (
     }
   });
 
-  fastify.get('/metrics', async (req: any, reply: any) => {
+  fastify.get('/api/prometheus', async (req: any, reply: any) => {
     try {
       const { getPrometheusExporter } = require('../utils/prometheus');
       const exporter = getPrometheusExporter(req.log);

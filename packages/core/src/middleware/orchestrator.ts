@@ -446,10 +446,14 @@ export class MiddlewareOrchestrator {
       this.logger.info("  ToolCompressor: enabled");
     }
 
-    this.idempotencyGuard.initialize();
+    if (typeof (this.idempotencyGuard as any).initialize === 'function') {
+      this.idempotencyGuard.initialize();
+    }
     this.logger.info(`  IdempotencyGuard: ${this.idempotencyGuard['config']?.enabled ? 'enabled' : 'disabled'}`);
 
-    this.keyManager.initialize();
+    if (typeof (this.keyManager as any).initialize === 'function') {
+      this.keyManager.initialize();
+    }
     this.logger.info(`  KeyManager: ${this.keyManager['config']?.enabled ? 'enabled' : 'disabled'}`);
 
     await this.qdrantCache.initialize();
