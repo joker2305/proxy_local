@@ -67,14 +67,22 @@ export class RAGPipeline {
     const chunks = this.chunkText(doc.content);
     const ids: string[] = [];
 
+    if (chunks.length === 0) {
+      this.logger?.warn(`RAGPipeline: no chunks produced from ${doc.source} (${doc.content.length} chars)`);
+      return ids;
+    }
+
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
       const id = this.generateDocId(doc.source, i);
 
       const embedding = await this.getEmbedding(chunk);
-      if (embedding.length === 0) continue;
+      if (embedding.length === 0) {
+        this.logger?.warn(`RAGPipeline: embedding failed for chunk ${i} of ${doc.source}, skipping`);
+        continue;
+      }
 
-      await this.upsertPoint(id, embedding, {
+      const ok = await this.upsertPoint(id, embedding, {
         content: chunk,
         source: doc.source,
         tags: doc.tags,
@@ -84,10 +92,14 @@ export class RAGPipeline {
         createdAt: Date.now(),
       });
 
-      ids.push(id);
+      if (ok) {
+        ids.push(id);
+      } else {
+        this.logger?.warn(`RAGPipeline: upsert failed for chunk ${i} of ${doc.source}`);
+      }
     }
 
-    this.logger?.debug(`RAGPipeline: ingested ${ids.length} chunks from ${doc.source}`);
+    this.logger?.info(`RAGPipeline: ingested ${ids.length}/${chunks.length} chunks from ${doc.source}`);
     return ids;
   }
 
@@ -95,7 +107,10 @@ export class RAGPipeline {
     if (!this.initialized) await this.initialize();
 
     const embedding = await this.getEmbedding(queryText);
-    if (embedding.length === 0) return [];
+    if (embedding.length === 0) {
+      this.logger?.warn('RAGPipeline: query embedding failed, returning empty results');
+      return [];
+    }
 
     try {
       const must: any[] = [];
@@ -129,7 +144,10 @@ export class RAGPipeline {
         }
       );
 
-      if (!response.ok) return [];
+      if (!response.ok) {
+        this.logger?.warn(`RAGPipeline query: Qdrant returned ${response.status}`);
+        return [];
+      }
 
       const data = await response.json();
       if (!data.result) return [];
@@ -147,7 +165,7 @@ export class RAGPipeline {
         snippet: point.payload.content.substring(0, 200),
       }));
     } catch (e: any) {
-      this.logger?.debug(`RAGPipeline query failed: ${e.message}`);
+      this.logger?.warn(`RAGPipeline query failed: ${e.message}`);
       return [];
     }
   }
@@ -219,48 +237,95 @@ export class RAGPipeline {
     };
   }
 
+  /**
+   * Character-based chunking that works for both Chinese and English text.
+   * Splits by paragraph boundaries first, then by character count.
+   */
   private chunkText(text: string): string[] {
+    if (!text || text.trim().length === 0) return [];
+
     const chunks: string[] = [];
-    const words = text.split(/\s+/);
+    // Split by paragraph boundaries (double newline or double CRLF)
+    const paragraphs = text.split(/\n{2,}|\r\n{2,}/);
+
     let current = '';
 
-    for (const word of words) {
-      if (current.length + word.length > this.config.chunkSize) {
-        if (current) chunks.push(current.trim());
-        const overlapWords = current.split(/\s+/).slice(-Math.ceil(this.config.chunkOverlap / 5));
-        current = overlapWords.join(' ') + ' ' + word;
+    for (const para of paragraphs) {
+      const trimmed = para.trim();
+      if (!trimmed) continue;
+
+      if (current.length + trimmed.length + 2 <= this.config.chunkSize) {
+        current += (current ? '\n\n' : '') + trimmed;
       } else {
-        current += ' ' + word;
+        // Flush current chunk
+        if (current) chunks.push(current);
+
+        // If single paragraph exceeds chunk size, split by character count
+        if (trimmed.length > this.config.chunkSize) {
+          let offset = 0;
+          while (offset < trimmed.length) {
+            const end = Math.min(offset + this.config.chunkSize, trimmed.length);
+            chunks.push(trimmed.substring(offset, end));
+            // Move forward, applying overlap
+            const step = Math.max(this.config.chunkSize - this.config.chunkOverlap, 1);
+            offset += step;
+          }
+          current = '';
+        } else {
+          current = trimmed;
+        }
       }
     }
 
-    if (current.trim()) chunks.push(current.trim());
+    if (current.trim()) chunks.push(current);
+
     return chunks;
   }
 
+  /**
+   * Get embedding vector from Ollama. Tries /api/embed first (newer),
+   * falls back to /api/embeddings (legacy).
+   */
   private async getEmbedding(text: string): Promise<number[]> {
     try {
-      const truncated = text.substring(0, 2000);
+      const truncated = text.substring(0, 8000);
+
+      // Try newer /api/embed endpoint first
       let response = await fetch(`${this.config.ollamaEndpoint}/api/embed`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: this.config.ollamaModel, input: truncated }),
       });
-      if (!response.ok) {
-        response = await fetch(`${this.config.ollamaEndpoint}/api/embeddings`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model: this.config.ollamaModel, prompt: truncated }),
-        });
+
+      if (response.ok) {
+        const data = await response.json();
+        const embedding = data.embeddings?.[0] || [];
+        if (embedding.length > 0) return embedding;
       }
-      if (!response.ok) return [];
-      const data = await response.json();
-      return data.embeddings?.[0] || data.embedding || [];
-    } catch {
+
+      // Fallback to legacy /api/embeddings endpoint
+      response = await fetch(`${this.config.ollamaEndpoint}/api/embeddings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: this.config.ollamaModel, prompt: truncated }),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data.embedding && data.embedding.length > 0) return data.embedding;
+      }
+
+      this.logger?.warn(`RAGPipeline getEmbedding: Ollama returned no embedding (status: ${response.status})`);
+      return [];
+    } catch (e: any) {
+      this.logger?.warn(`RAGPipeline getEmbedding failed: ${e.message}`);
       return [];
     }
   }
 
+  /**
+   * Ensure Qdrant collection exists. Creates with correct PUT endpoint.
+   */
   private async ensureCollection(): Promise<void> {
     try {
       const response = await fetch(
@@ -268,33 +333,73 @@ export class RAGPipeline {
       );
       if (response.ok) return;
 
-      await fetch(`${this.config.qdrantUrl}/collections`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          vectors: { size: this.config.embeddingDimension, distance: 'Cosine' },
-        }),
-      });
+      // Create collection using PUT with collection name in URL path
+      const createResponse = await fetch(
+        `${this.config.qdrantUrl}/collections/${this.config.qdrantCollection}`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            vectors: { size: this.config.embeddingDimension, distance: 'Cosine' },
+          }),
+        }
+      );
+
+      if (createResponse.ok) {
+        this.logger?.info(`RAGPipeline: created Qdrant collection '${this.config.qdrantCollection}'`);
+      } else {
+        const body = await createResponse.text();
+        this.logger?.warn(`RAGPipeline: failed to create collection: ${createResponse.status} ${body}`);
+      }
     } catch (e: any) {
-      this.logger?.debug(`RAGPipeline ensureCollection: ${e.message}`);
+      this.logger?.warn(`RAGPipeline ensureCollection failed: ${e.message}`);
     }
   }
 
-  private async upsertPoint(id: string, vector: number[], payload: Record<string, any>): Promise<void> {
-    await fetch(`${this.config.qdrantUrl}/collections/${this.config.qdrantCollection}/points`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        points: [{ id, vector, payload }],
-      }),
-    });
+  /**
+   * Upsert a point into Qdrant with deterministic UUID ID.
+   * Qdrant requires integer or UUID-format string IDs.
+   */
+  private async upsertPoint(id: string, vector: number[], payload: Record<string, any>): Promise<boolean> {
+    try {
+      const response = await fetch(
+        `${this.config.qdrantUrl}/collections/${this.config.qdrantCollection}/points?wait=true`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            points: [{ id, vector, payload }],
+          }),
+        }
+      );
+
+      if (!response.ok) {
+        const body = await response.text();
+        this.logger?.warn(`RAGPipeline upsertPoint failed: ${response.status} ${body}`);
+      }
+      return response.ok;
+    } catch (e: any) {
+      this.logger?.warn(`RAGPipeline upsertPoint error: ${e.message}`);
+      return false;
+    }
   }
 
+  /**
+   * Generate a deterministic UUID v4 from source+chunkIndex.
+   * Qdrant requires either uint64 or UUID-format string IDs.
+   */
   private generateDocId(source: string, chunkIndex: number): string {
-    return createHash('sha256')
+    const hash = createHash('sha256')
       .update(`${source}:${chunkIndex}`)
-      .digest('hex')
-      .substring(0, 16);
+      .digest('hex');
+    // Format as UUID v4 (xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx)
+    return [
+      hash.substring(0, 8),
+      hash.substring(8, 12),
+      '4' + hash.substring(13, 16),
+      ((parseInt(hash.substring(16, 18), 16) & 0x3) | 0x8).toString(16) + hash.substring(17, 20),
+      hash.substring(20, 32),
+    ].join('-');
   }
 }
 

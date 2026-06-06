@@ -545,6 +545,17 @@ async function getServer(options: RunOptions = {}) {
     serverInstance.app.log.debug(`SecurityHardener: skipped (${err?.message})`);
   }
 
+  // Auto-initialize EmbeddingService in background (non-blocking)
+  try {
+    const { getEmbeddingService } = await import('@musistudio/llms');
+    const embService = getEmbeddingService(undefined, serverInstance.app.log);
+    embService.initialize().then((ok: boolean) => {
+      serverInstance.app.log.info(`EmbeddingService: ${ok ? 'available' : 'unavailable'} (ollama)`);
+    }).catch(() => {});
+  } catch (err: any) {
+    serverInstance.app.log.debug(`EmbeddingService: skipped (${err?.message})`);
+  }
+
   return serverInstance;
 }
 
