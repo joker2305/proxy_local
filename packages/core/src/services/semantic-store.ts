@@ -299,7 +299,12 @@ export class SemanticStoreService {
 
       const data = await response.json() as any;
 
-      // Ollama format: { embedding: [...] }
+      // Ollama /api/embed format: { embeddings: [[...]] }
+      if (Array.isArray(data.embeddings?.[0])) {
+        return data.embeddings[0];
+      }
+
+      // Ollama legacy /api/embeddings format: { embedding: [...] }
       if (Array.isArray(data.embedding)) {
         return data.embedding;
       }
@@ -309,7 +314,7 @@ export class SemanticStoreService {
         return data.data[0].embedding;
       }
 
-      this.logger.warn('Unknown embedding response format');
+      this.logger.warn(`Unknown embedding response format: ${JSON.stringify(Object.keys(data))}`);
       return null;
     } catch (error: any) {
       this.logger.warn(`Embedding generation failed: ${error.message}`);
