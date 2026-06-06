@@ -281,3 +281,12 @@ This completes the transition from "CCR as black-box gateway" to "CCR as transpa
 - Verified `/v1/chat/completions` endpoint registered via `openai.transformer.ts` — works for OpenCode's `@ai-sdk/openai-compatible`
 - All 3 commits (Round 4-6) total: 9 files changed, 809 insertions, 149 deletions
 - 353/354 tests pass (1 pre-existing config-generator failure unrelated to changes)
+
+### Round 7 Context — Bug Fix & Custom Tools (commit 9a211b0+)
+
+- **Fixed config-generator test failure**: `generateCcrConfig("")` was calling `validateConfig()` before checking for null/empty input, causing it to throw instead of returning defaults. Fixed by reordering: null/empty check → defaults return, then validate non-null parsed config.
+- **Added standalone OpenCode custom tools** in `.opencode/tools/`:
+  - `ccr_search.js`: Search CCR semantic store (standalone, not plugin-dependent)
+  - `ccr_store.js`: Store context in CCR semantic store
+- These tools use the plain object export format (not `tool()` helper) for maximum compatibility
+- **354/354 tests now pass** (was 353/354)

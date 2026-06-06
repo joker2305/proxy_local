@@ -233,8 +233,153 @@ class MinimalYamlParser {
   }
 }
 
+export interface ValidationError {
+  field: string;
+  message: string;
+  severity: 'error' | 'warning';
+}
+
 export function parseYaml(input: string): any {
   return new MinimalYamlParser().parse(input);
+}
+
+/**
+ * Validate a parsed YAML config for common errors and security issues.
+ * Returns an array of validation issues (errors block generation, warnings don't).
+ */
+export function validateConfig(parsed: any): ValidationError[] {
+  const issues: ValidationError[] = [];
+
+  if (!parsed || typeof parsed !== 'object') {
+    issues.push({ field: 'root', message: 'Config must be a YAML object', severity: 'error' });
+    return issues;
+  }
+
+  // Check for hardcoded API keys in providers
+  if (parsed.providers && Array.isArray(parsed.providers)) {
+    for (const p of parsed.providers) {
+      if (!p.name) {
+        issues.push({ field: 'providers', message: 'Each provider must have a name', severity: 'error' });
+        continue;
+      }
+      if (!p.api_base_url) {
+        issues.push({ field: `providers.${p.name}.api_base_url`, message: 'Provider missing api_base_url', severity: 'error' });
+      }
+      // Check for hardcoded API keys (not env var references)
+      if (p.api_key && typeof p.api_key === 'string') {
+        if (!p.api_key.startsWith('${') && p.api_key !== 'ollama' && p.api_key.length > 10 && !p.api_key.includes('***')) {
+          issues.push({
+            field: `providers.${p.name}.api_key`,
+            message: `API key appears to be hardcoded. Use \${ENV_VAR} syntax instead.`,
+            severity: 'warning',
+          });
+        }
+      }
+      // Check for valid models list
+      if (!p.models || !Array.isArray(p.models) || p.models.length === 0) {
+        issues.push({
+          field: `providers.${p.name}.models`,
+          message: 'Provider should have at least one model',
+          severity: 'warning',
+        });
+      }
+    }
+
+    // Check for duplicate provider names
+    const names = parsed.providers.map((p: any) => p.name);
+    const dupes = names.filter((n: string, i: number) => names.indexOf(n) !== i);
+    if (dupes.length > 0) {
+      issues.push({
+        field: 'providers',
+        message: `Duplicate provider names: ${[...new Set(dupes)].join(', ')}`,
+        severity: 'error',
+      });
+    }
+  }
+
+  // Validate tiers configuration
+  if (parsed.tiers) {
+    const validTierNames = ['premium', 'standard', 'fast'];
+    for (const [tierName, tierConfig] of Object.entries(parsed.tiers as Record<string, any>)) {
+      if (!tierConfig.models || !Array.isArray(tierConfig.models) || tierConfig.models.length === 0) {
+        issues.push({
+          field: `tiers.${tierName}.models`,
+          message: `Tier '${tierName}' must have at least one model pattern`,
+          severity: 'warning',
+        });
+      }
+      // Validate scenario models reference existing providers
+      if (tierConfig.scenarios) {
+        for (const [scenario, model] of Object.entries(tierConfig.scenarios as Record<string, string>)) {
+          if (typeof model === 'string' && model.includes(',')) {
+            const [providerName] = model.split(',');
+            const providerExists = parsed.providers?.some((p: any) => p.name === providerName);
+            if (!providerExists) {
+              issues.push({
+                field: `tiers.${tierName}.scenarios.${scenario}`,
+                message: `Scenario references unknown provider '${providerName}'`,
+                severity: 'warning',
+              });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Validate routing references
+  if (parsed.routing) {
+    for (const [key, value] of Object.entries(parsed.routing as Record<string, any>)) {
+      if (typeof value === 'string' && value.includes(',') && key !== 'longContextThreshold') {
+        const [providerName] = value.split(',');
+        const providerExists = parsed.providers?.some((p: any) => p.name === providerName);
+        if (!providerExists) {
+          issues.push({
+            field: `routing.${key}`,
+            message: `Route references unknown provider '${providerName}'`,
+            severity: 'warning',
+          });
+        }
+      }
+    }
+  }
+
+  // Validate fallback references
+  if (parsed.fallback) {
+    for (const [scenario, models] of Object.entries(parsed.fallback as Record<string, any>)) {
+      if (Array.isArray(models)) {
+        for (const model of models) {
+          if (typeof model === 'string' && model.includes(',')) {
+            const [providerName] = model.split(',');
+            const providerExists = parsed.providers?.some((p: any) => p.name === providerName);
+            if (!providerExists) {
+              issues.push({
+                field: `fallback.${scenario}`,
+                message: `Fallback references unknown provider '${providerName}'`,
+                severity: 'warning',
+              });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Security: check for obvious key patterns in any string value
+  const keyPatterns = [/sk-[a-zA-Z0-9]{20,}/, /ghp_[a-zA-Z0-9]{36,}/];
+  const configStr = JSON.stringify(parsed);
+  for (const pattern of keyPatterns) {
+    const match = configStr.match(pattern);
+    if (match) {
+      issues.push({
+        field: 'config',
+        message: `Possible hardcoded API key detected: ${match[0].slice(0, 10)}...`,
+        severity: 'error',
+      });
+    }
+  }
+
+  return issues;
 }
 
 export function generateCcrConfig(yamlContent: string): Record<string, any> {
@@ -249,6 +394,21 @@ export function generateCcrConfig(yamlContent: string): Record<string, any> {
       LOG_LEVEL: 'info',
       API_TIMEOUT_MS: 600000,
     };
+  }
+
+  const validationIssues = validateConfig(parsed);
+  const errors = validationIssues.filter(i => i.severity === 'error');
+  const warnings = validationIssues.filter(i => i.severity === 'warning');
+
+  if (warnings.length > 0) {
+    for (const w of warnings) {
+      console.warn(`Config validation [WARN]: ${w.field}: ${w.message}`);
+    }
+  }
+
+  if (errors.length > 0) {
+    const msgs = errors.map(e => `  - ${e.field}: ${e.message}`).join('\n');
+    throw new Error(`Config validation failed:\n${msgs}`);
   }
 
   const config: Record<string, any> = {};
@@ -308,6 +468,16 @@ export function generateCcrConfig(yamlContent: string): Record<string, any> {
 
   if (parsed.routing) {
     config.Router = { ...parsed.routing };
+  }
+
+  if (parsed.tiers) {
+    config.tiers = {};
+    for (const [tierName, tierConfig] of Object.entries(parsed.tiers)) {
+      config.tiers[tierName] = {
+        models: tierConfig.models || [],
+        scenarios: tierConfig.scenarios || {},
+      };
+    }
   }
 
   if (parsed.model_mapping) {
