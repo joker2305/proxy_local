@@ -144,6 +144,7 @@ export class EvolutionBridge {
   }
 
   detectSkills(requestBody: any): SkillRef[] {
+    if (!this.config.enabled) return [];
     const skills: SkillRef[] = [];
     const text = this.extractAllText(requestBody);
     if (!text) return skills;
@@ -217,6 +218,7 @@ export class EvolutionBridge {
     preferredModel: string;
     maxBudgetTokens: number;
   } {
+    if (!this.config.enabled) return { preferredTier: "", preferredModel: "", maxBudgetTokens: 0 };
     if (!this.config.skillAwareRouting || skills.length === 0) {
       return { preferredTier: "", preferredModel: "", maxBudgetTokens: 0 };
     }
@@ -236,6 +238,7 @@ export class EvolutionBridge {
   }
 
   buildContextInjection(skills: SkillRef[]): string {
+    if (!this.config.enabled) return "";
     if (!this.config.contextInjection || skills.length === 0) return "";
 
     const contexts = this.getSkillContexts(skills);

@@ -41,7 +41,7 @@ import { RequestReplay, ReplayConfig } from "./request-replay";
 import { StructuredOutputEnforcer, StructuredOutputConfig } from "./structured-output";
 import { ABTestingFramework, ABTestConfig } from "./ab-testing";
 import { FinancialPIIMasker, FinancialPIIMaskerConfig } from "./financial-pii-masker";
-import { checkHallucination, analyzeReasoning } from "../engines/reasoning-engine";
+import { checkHallucination } from "../engines/reasoning-engine";
 import type { ReasoningContext } from "../engines/reasoning-engine";
 import { MultiLevelCache, getMultiLevelCache, type CacheKey } from "../utils/multi-level-cache";
 import { SecurityHardener, getSecurityHardener } from "../utils/security-hardener";
@@ -49,6 +49,7 @@ import { PrometheusExporter, getPrometheusExporter } from "../utils/prometheus";
 import { TrafficMirror, getTrafficMirror } from "../utils/traffic-mirror";
 import { AdaptiveRouter, getAdaptiveRouter } from "../utils/adaptive-router";
 import { getRedisCache } from "../utils/redis-cache";
+import { getEmbeddingService } from "../utils/embedding";
 import { redactObject } from "../utils/redactor";
 import { getPromptTemplateEngine } from "../utils/prompt-template";
 import { getWsPush } from "../utils/ws-push";
@@ -262,7 +263,7 @@ export class MiddlewareOrchestrator {
         jsonlPath: this.configService.get("CONTEXT_CAPTURE_JSONL_PATH") || "./dev/captures.jsonl",
       },
       reasoningCache: {
-        enabled: this.configService.get("REASONING_CACHE_ENABLED") !== false,
+        enabled: this.configService.get("REASONING_CACHE_ENABLED") === true,
         postgresConnectionString: this.configService.get("PG_CONNECTION_STRING"),
         maxChainLength: this.configService.get("REASONING_CACHE_MAX_CHAIN_LENGTH") || 8000,
         maxResults: this.configService.get("REASONING_CACHE_MAX_RESULTS") || 3,
@@ -372,6 +373,25 @@ export class MiddlewareOrchestrator {
         maxConcurrent: this.configService.get("RATE_LIMITER_QUEUE_MAX_CONCURRENT") || 5,
         maxQueueSize: this.configService.get("RATE_LIMITER_QUEUE_MAX_SIZE") || 100,
       },
+      multiLevelCache: {
+        enabled: this.configService.get("MULTI_LEVEL_CACHE_ENABLED") === true,
+        l1MaxSize: this.configService.get("MULTI_LEVEL_CACHE_L1_MAX") || 1000,
+        l2Enabled: this.configService.get("MULTI_LEVEL_CACHE_L2_ENABLED") === true,
+        l3Enabled: this.configService.get("MULTI_LEVEL_CACHE_L3_ENABLED") === true,
+      },
+      securityHardener: {
+        enabled: this.configService.get("SECURITY_HARDENER_ENABLED") !== false,
+      },
+      prometheus: {
+        enabled: this.configService.get("PROMETHEUS_ENABLED") === true,
+      },
+      trafficMirror: {
+        enabled: this.configService.get("TRAFFIC_MIRROR_ENABLED") === true,
+        targets: this.configService.get("TRAFFIC_MIRROR_TARGETS") || [],
+      },
+      adaptiveRouter: {
+        enabled: this.configService.get("ADAPTIVE_ROUTER_ENABLED") === true,
+      },
     };
   }
 
@@ -392,6 +412,25 @@ export class MiddlewareOrchestrator {
 
     // Initialize reasoning cache
     await this.reasoningCache.initialize();
+
+    // Initialize embedding service (needed by SemanticCache + MultiLevelCache L3)
+    try {
+      const embeddingProvider = this.configService.get('EMBEDDING_PROVIDER') || 'ollama';
+      const embeddingBaseUrl = this.configService.get('EMBEDDING_BASE_URL') || 'http://localhost:11434';
+      const embeddingModel = this.configService.get('EMBEDDING_MODEL') || 'nomic-embed-text';
+      const embeddingService = getEmbeddingService({
+        enabled: true,
+        provider: embeddingProvider,
+        baseUrl: embeddingBaseUrl,
+        model: embeddingModel,
+      }, this.logger);
+      const available = await embeddingService.initialize();
+      this.logger.info(
+        `  EmbeddingService: ${available ? `available (${embeddingProvider}/${embeddingModel})` : `unavailable (${embeddingProvider} at ${embeddingBaseUrl})`}`
+      );
+    } catch (e: any) {
+      this.logger.debug(`  EmbeddingService: skipped (${e?.message})`);
+    }
 
     // Initialize Redis cache L2
     try {
@@ -447,14 +486,14 @@ export class MiddlewareOrchestrator {
     }
 
     if (typeof (this.idempotencyGuard as any).initialize === 'function') {
-      this.idempotencyGuard.initialize();
+      (this.idempotencyGuard as any).initialize();
     }
-    this.logger.info(`  IdempotencyGuard: ${this.idempotencyGuard['config']?.enabled ? 'enabled' : 'disabled'}`);
+    this.logger.info(`  IdempotencyGuard: ${(this.idempotencyGuard as any)['config']?.enabled ? 'enabled' : 'disabled'}`);
 
     if (typeof (this.keyManager as any).initialize === 'function') {
-      this.keyManager.initialize();
+      (this.keyManager as any).initialize();
     }
-    this.logger.info(`  KeyManager: ${this.keyManager['config']?.enabled ? 'enabled' : 'disabled'}`);
+    this.logger.info(`  KeyManager: ${(this.keyManager as any)['mgrConfig']?.enabled ? 'enabled' : 'disabled'}`);
 
     await this.qdrantCache.initialize();
     this.logger.info(`  QdrantCache: ${this.qdrantCache['config']?.enabled ? 'enabled' : 'disabled'}`);
@@ -581,9 +620,10 @@ export class MiddlewareOrchestrator {
     if (this.healthMonitor) {
       this.healthMonitor.stop();
     }
-    try { await this.reasoningCache.cleanup(); } catch {}
+    try { await this.reasoningCache.cleanup(); } catch (e: any) { this.logger?.debug(`Shutdown reasoningCache: ${e?.message}`); }
 
     this.sessionBridge.cleanup();
+    this.semanticCache.shutdown();
     this.evolutionBridge.shutdown();
     this.langfuseTracer.shutdown();
     this.idempotencyGuard.shutdown();
@@ -592,26 +632,26 @@ export class MiddlewareOrchestrator {
     // Shutdown Redis cache
     try {
       const redisCache = getRedisCache();
-      if (redisCache) await redisCache.shutdown();
-    } catch {}
+      if (redisCache && typeof (redisCache as any).shutdown === 'function') await (redisCache as any).shutdown();
+    } catch (e: any) { this.logger?.debug(`Shutdown RedisCache: ${e?.message}`); }
 
     // Shutdown task queue
     try {
       const queue = getTaskQueue();
-      if (queue) await queue.shutdown();
-    } catch {}
+      if (queue && typeof (queue as any).shutdown === 'function') await (queue as any).shutdown();
+    } catch (e: any) { this.logger?.debug(`Shutdown TaskQueue: ${e?.message}`); }
 
     // Shutdown cache warmer
     try {
       const warmer = getCacheWarmer();
       if (warmer) warmer.stop();
-    } catch {}
+    } catch (e: any) { this.logger?.debug(`Shutdown CacheWarmer: ${e?.message}`); }
 
     // Shutdown WebSocket push
     try {
       const wsPush = getWsPush();
-      if (wsPush) wsPush.shutdown();
-    } catch {}
+      if (wsPush && typeof (wsPush as any).shutdown === 'function') (wsPush as any).shutdown();
+    } catch (e: any) { this.logger?.debug(`Shutdown WsPush: ${e?.message}`); }
 
     this.initialized = false;
 
@@ -839,7 +879,7 @@ export class MiddlewareOrchestrator {
       try {
         const promptEngine = getPromptTemplateEngine();
         if (promptEngine) {
-          const templateResult = promptEngine.processSystemPrompt(
+          const processedSystem = promptEngine.processSystemPrompt(
             req.body.system,
             {
               sessionId: context.sessionId,
@@ -848,8 +888,8 @@ export class MiddlewareOrchestrator {
               model: (req as any).model || req.body?.model,
             }
           );
-          if (templateResult.modified) {
-            req.body.system = templateResult.prompt;
+          if (processedSystem !== req.body.system) {
+            req.body.system = processedSystem;
             (req as any)._templateApplied = true;
           }
         }
@@ -877,9 +917,9 @@ export class MiddlewareOrchestrator {
 
       if (this.financialPIIMasker.getStats().enabled) {
         const maskResult = this.financialPIIMasker.maskBody(req.body);
-        if (maskResult.masked) {
+        if (maskResult.maskMap.size > 0) {
           req.body = maskResult.body;
-          (req as any)._piiMasked = maskResult.maskedCount;
+          (req as any)._piiMasked = maskResult.maskMap.size;
         }
       }
 
@@ -969,8 +1009,6 @@ export class MiddlewareOrchestrator {
           taskType: context.taskType,
           model: (req as any).body?.model || "unknown",
           tokenCount: (req as any).tokenCount,
-        }).catch((err) => {
-          this.logger?.debug(`SemanticCache store failed: ${err?.message}`);
         });
 
         // L2 Redis cache store (fire-and-forget)
@@ -1013,7 +1051,7 @@ export class MiddlewareOrchestrator {
         }
       }
 
-      if (this.keyManager['config']?.enabled) {
+      if (this.keyManager['mgrConfig']?.enabled) {
         const provider = (req as any).provider;
         const statusCode = (req as any)._httpStatus || 200;
         const usedKey = (req as any)._usedApiKey;
@@ -1064,7 +1102,7 @@ export class MiddlewareOrchestrator {
       try {
         redactedBody = redactObject(req.body);
         redactedResponse = redactObject(responseBody);
-      } catch {}
+      } catch (e: any) { this.logger.debug(`onPostResponse redact failed: ${e?.message}`); }
 
       this.contextCapture.capture({
         sessionId: context.sessionId,
@@ -1100,7 +1138,7 @@ export class MiddlewareOrchestrator {
               model: (req as any).model,
             });
           }
-        } catch {}
+        } catch (e: any) { this.logger.debug(`onPostResponse ws-push/hallucination failed: ${e?.message}`); }
       }
 
       // Self-reflection loop (if enabled, for non-streaming responses)
@@ -1179,10 +1217,10 @@ export class MiddlewareOrchestrator {
                   responseSummary: responseText.slice(0, 200),
                 });
               }
-            } catch {}
-          }).catch(() => {});
+            } catch (e: any) { this.logger.debug(`onPostResponse quality audit failed: ${e?.message}`); }
+          }).catch((e: any) => { this.logger.debug(`onPostResponse quality audit async failed: ${e?.message}`); });
         }
-      } catch {}
+      } catch (e: any) { this.logger.debug(`onPostResponse reasoning analysis failed: ${e?.message}`); }
 
       // SessionBridge: process response for tool chain tracking
       try {
@@ -1279,7 +1317,7 @@ export class MiddlewareOrchestrator {
           (req as any).provider || 'unknown',
           (req as any).model || 'unknown',
           responseBody
-        ).catch(() => {});
+        ).catch((e: any) => { this.logger.debug(`TrafficMirror failed: ${e?.message}`); });
       }
 
       // v2: Security audit entry
@@ -1331,7 +1369,7 @@ export class MiddlewareOrchestrator {
             scenarioType: (req as any).scenarioType,
           });
         }
-      } catch {}
+      } catch (e: any) { this.logger.debug(`onError metrics/reporting failed: ${e?.message}`); }
     } catch (e: any) {
       this.logger?.error(`MiddlewareOrchestrator onError hook failed: ${e?.message}`);
     }
@@ -1367,6 +1405,23 @@ export class MiddlewareOrchestrator {
     hooks: Record<string, number>;
     health: { name: string; healthy: boolean; latency: number }[];
     redis: { connected: boolean; hits: number; misses: number };
+    langfuse?: any;
+    toolCompressor?: any;
+    idempotency?: any;
+    keyManager?: any;
+    qdrantCache?: any;
+    cacheReport?: any;
+    v2?: {
+      multiLevelCache?: any;
+      securityHardener?: any;
+      prometheus?: any;
+      trafficMirror?: any;
+      adaptiveRouter?: any;
+      fallbackChain?: any;
+      ragPipeline?: any;
+      adaptiveParams?: any;
+      rateLimiterQueue?: any;
+    };
   } {
     let redisStats = { connected: false, hits: 0, misses: 0 };
     try {
@@ -1375,7 +1430,7 @@ export class MiddlewareOrchestrator {
         const stats = redisCache.getStats();
         redisStats = { connected: true, ...stats };
       }
-    } catch {}
+    } catch (e: any) { this.logger.debug(`getSummary RedisCache stats failed: ${e?.message}`); }
 
     return {
       cache: this.semanticCache.getStats(),
@@ -1398,7 +1453,7 @@ export class MiddlewareOrchestrator {
               l2: redisStats,
             });
           }
-        } catch {}
+        } catch (e: any) { this.logger.debug(`getSummary cache report failed: ${e?.message}`); }
         return null;
       })(),
       v2: {

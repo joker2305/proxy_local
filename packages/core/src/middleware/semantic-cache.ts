@@ -64,8 +64,18 @@ export class SemanticCache extends EventEmitter {
     this.embeddingService = getEmbeddingService(undefined, logger);
 
     // Periodic cleanup of expired entries
-    setInterval(() => this.cleanup(), 60000);
+    this._cleanupTimer = setInterval(() => this.cleanup(), 60000) as any;
   }
+
+  shutdown(): void {
+    if (this._cleanupTimer) {
+      clearInterval(this._cleanupTimer as any);
+      this._cleanupTimer = null;
+    }
+    this.cache.clear();
+  }
+
+  private _cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   /**
    * Check if request has a cached response.
@@ -75,6 +85,7 @@ export class SemanticCache extends EventEmitter {
     sessionId?: string;
     agentName?: string;
     taskType?: string;
+    model?: string;
   }): Promise<any | null> {
     if (!this.enabled) return null;
 

@@ -42,6 +42,7 @@ import { getFinancialDataService } from "@/utils/financial-data";
 import { writeFile, mkdir } from "fs/promises";
 import { join } from "path";
 import { homedir } from "os";
+import { isPrivateIP } from "@/services/provider-registry";
 
 const SETUP_CONFIG_DIR = join(homedir(), ".claude-code-router");
 const SETUP_CONFIG_FILE = join(SETUP_CONFIG_DIR, "config.json");
@@ -119,23 +120,23 @@ async function handleTransformerEndpoint(
   // Tenant-aware rate limiting
   const tenantManager = getTenantManager();
   if (tenantManager) {
-    const tenantId = req.headers['x-tenant-id'] as string || req.headers['x-user-id'] as string;
-    if (tenantId) {
-      const tenantConfig = tenantManager.getTenantConfig(tenantId);
-      if (tenantConfig) {
-        // Check tenant-specific model allowlist
-        if (tenantConfig.modelAllowlist && tenantConfig.modelAllowlist.length > 0) {
-          const requestedModel = body.model || '';
-          const allowed = tenantConfig.modelAllowlist.some((m: string) => requestedModel.includes(m));
-          if (!allowed) {
-            throw createApiError(
-              `Model '${requestedModel}' not allowed for tenant '${tenantId}'`,
-              403,
-              "tenant_model_denied"
-            );
+      const tenantId = req.headers['x-tenant-id'] as string || req.headers['x-user-id'] as string;
+      if (tenantId) {
+        const tenantCtx = tenantManager.resolve(tenantId);
+        if (tenantCtx) {
+          const modelAllowlist = tenantCtx.allowedModels;
+          if (modelAllowlist && modelAllowlist.length > 0) {
+            const requestedModel = body.model || '';
+            const allowed = modelAllowlist.some((m: string) => requestedModel.includes(m));
+            if (!allowed) {
+              throw createApiError(
+                `Model '${requestedModel}' not allowed for tenant '${tenantId}'`,
+                403,
+                "tenant_model_denied"
+              );
+            }
           }
         }
-      }
     }
   }
 
@@ -170,7 +171,7 @@ async function handleTransformerEndpoint(
   }
 
   // Budget soft-limit warning (throttle)
-  if (budgetResult.throttle) {
+  if (budgetResult.throttleMs) {
     try {
       const wsPush = getWsPush();
       if (wsPush) {
@@ -488,13 +489,26 @@ function shouldBypassTransformers(
   transformer: any,
   body: any
 ): boolean {
-  return (
+  if (
     provider.transformer?.use?.length === 1 &&
     provider.transformer.use[0].name === transformer.name &&
     (!provider.transformer?.[body.model]?.use?.length ||
       (provider.transformer?.[body.model]?.use.length === 1 &&
         provider.transformer?.[body.model]?.use[0].name === transformer.name))
-  );
+  ) {
+    return true;
+  }
+
+  const baseUrl = (provider.api_base_url || provider.baseUrl || '').toLowerCase();
+  if (
+    transformer.name === 'Anthropic' &&
+    (baseUrl.includes('/anthropic') || baseUrl.includes('bigmodel.cn/api/anthropic')) &&
+    !provider.transformer?.use?.length
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 /**
@@ -595,6 +609,11 @@ async function sendRequestToProvider(
     async () => {
       metrics.incrementActive();
       try {
+        // Debug: check requestBody type before sending
+        if (typeof requestBody === 'string') {
+          fastify.log.warn(`[CCR-BUG] requestBody is string (${requestBody.length} chars), parsing back to object`);
+          try { requestBody = JSON.parse(requestBody); } catch {}
+        }
         const res = await sendUnifiedRequest(
           url,
           requestBody,
@@ -779,6 +798,7 @@ function parseSSEToMessage(fullPayload: string): any | null {
           if (block) {
             if (parsed.delta?.type === 'text_delta') block.text = (block.text || '') + parsed.delta.text;
             else if (parsed.delta?.type === 'thinking_delta') block.thinking = (block.thinking || '') + parsed.delta.thinking;
+            else if (parsed.delta?.type === 'signature_delta') block.signature = (block.signature || '') + parsed.delta.signature;
             else if (parsed.delta?.type === 'input_json_delta') block.input = (block.input || '') + parsed.delta.partial_json;
           }
         } else if (parsed.type === 'message_delta' && finalMessage) {
@@ -984,6 +1004,16 @@ export const registerApiRoutes = async (
     return result;
   });
 
+  // Reset a specific circuit breaker
+  fastify.post("/api/circuit-breakers/:name/reset", async (req: any) => {
+    const { getAllCircuitBreakers } = await import("@/utils/circuit-breaker");
+    const breakers = getAllCircuitBreakers();
+    const breaker = breakers.get(req.params.name);
+    if (!breaker) return { error: `Circuit breaker '${req.params.name}' not found` };
+    breaker.forceClose();
+    return { success: true, name: req.params.name, state: breaker.getState().state };
+  });
+
   // Rate limiter status
   fastify.get("/api/rate-limiter", async () => {
     const rateLimiter = getRateLimiter();
@@ -1116,7 +1146,7 @@ export const registerApiRoutes = async (
   fastify.get("/api/cache-report", async () => {
     const reportAgg = getCacheReportAggregator();
     const metrics = getMetrics(fastify.log);
-    const stats = metrics.getStats();
+    const stats = metrics.getStats() as any;
     return reportAgg.generateReport({
       l1: { hits: stats.cache?.hits || 0, misses: stats.cache?.misses || 0, entries: stats.cache?.size || 0 },
       l2: { hits: stats.redis?.hits || 0, misses: stats.redis?.misses || 0, connected: !!stats.redis?.connected },
@@ -1236,7 +1266,7 @@ export const registerApiRoutes = async (
     const cacheReportAgg = getCacheReportAggregator();
     const diffTracker = getProxyDiffTracker();
 
-    const stats = metrics.getStats();
+    const stats = metrics.getStats() as any;
     const cacheReport = cacheReportAgg.generateReport({
       l1: { hits: stats.cache?.hits || 0, misses: stats.cache?.misses || 0, entries: stats.cache?.size || 0 },
       l2: { hits: stats.redis?.hits || 0, misses: stats.redis?.misses || 0, connected: !!stats.redis?.connected },
@@ -1263,10 +1293,51 @@ export const registerApiRoutes = async (
       uptime: process.uptime(),
     };
 
-    // 1. Metrics
+    let metricsStats: any = null;
     try {
       const metrics = getMetrics(fastify.log);
-      result.metrics = metrics.getStats();
+      metricsStats = metrics.getStats();
+      result.metrics = metricsStats;
+
+      // UI-compatible flat fields
+      const totalCache = (metricsStats.cache?.hits || 0) + (metricsStats.cache?.misses || 0);
+      result.requests = {
+        total: metricsStats.requests?.total || 0,
+        success: (metricsStats.requests?.total || 0) - (metricsStats.requests?.errors || 0),
+        failed: metricsStats.requests?.errors || 0,
+        trend: 0,
+      };
+      result.tokens = {
+        total: (metricsStats.tokens?.inputTotal || 0) + (metricsStats.tokens?.outputTotal || 0),
+        input: metricsStats.tokens?.inputTotal || 0,
+        output: metricsStats.tokens?.outputTotal || 0,
+        trend: 0,
+      };
+      result.cost = {
+        total: metricsStats.cost?.totalUsd || 0,
+        trend: 0,
+      };
+      result.latency = {
+        avg: metricsStats.latency?.p50 || 0,
+        p50: metricsStats.latency?.p50 || 0,
+        p99: metricsStats.latency?.p99 || 0,
+        trend: 0,
+      };
+      result.cache = {
+        hitRate: totalCache > 0 ? Math.round((metricsStats.cache.hits / totalCache) * 1000) / 10 : 0,
+        l1HitRate: 0,
+        l2HitRate: 0,
+        hits: metricsStats.cache?.hits || 0,
+        misses: metricsStats.cache?.misses || 0,
+      };
+
+      // Model token breakdown
+      const modelTokens: Array<{ name: string; tokens: number }> = [];
+      const tokensByProvider = metricsStats.tokens?.byProvider || {};
+      for (const [name, t] of Object.entries(tokensByProvider)) {
+        modelTokens.push({ name, tokens: (t as any).input + (t as any).output });
+      }
+      result.models = modelTokens;
     } catch (e: any) {
       result.metrics = { error: e.message };
     }
@@ -1283,13 +1354,18 @@ export const registerApiRoutes = async (
     try {
       const { getAllCircuitBreakers } = await import("@/utils/circuit-breaker");
       const breakers = getAllCircuitBreakers();
-      const cbResult: Record<string, any> = {};
+      const cbResult: Array<{ name: string; state: string; failures?: number; lastFailure?: string }> = [];
       for (const [name, breaker] of breakers) {
-        cbResult[name] = breaker.getState();
+        const state = breaker.getState();
+        cbResult.push({
+          name,
+          state: typeof state?.state === 'string' ? state.state.toLowerCase() : 'closed',
+          failures: state?.recentFailures ?? 0,
+        });
       }
       result.circuitBreakers = cbResult;
     } catch (e: any) {
-      result.circuitBreakers = { error: e.message };
+      result.circuitBreakers = [];
     }
 
     // 4. Rate Limiter
@@ -1304,7 +1380,7 @@ export const registerApiRoutes = async (
     try {
       const cacheReportAgg = getCacheReportAggregator();
       const metrics = getMetrics(fastify.log);
-      const stats = metrics.getStats();
+      const stats = metrics.getStats() as any;
       const report = cacheReportAgg.generateReport({
         l1: { hits: stats.cache?.hits || 0, misses: stats.cache?.misses || 0, entries: stats.cache?.size || 0 },
         l2: { hits: stats.redis?.hits || 0, misses: stats.redis?.misses || 0, connected: !!stats.redis?.connected },
@@ -1321,26 +1397,28 @@ export const registerApiRoutes = async (
     // 6. Quality Scorer
     try {
       const scorer = getQualityScorer();
-      result.quality = { enabled: true };
+      result.quality = { avgScore: 0 };
     } catch (e: any) {
-      result.quality = { error: e.message };
+      result.quality = { avgScore: 0 };
     }
 
     // 7. Providers (from health monitor)
     try {
       const orchestrator = (fastify as any)._server?.orchestrator;
+      const healthMap = metricsStats?.health || {};
       if (orchestrator?.healthMonitor) {
         result.providers = orchestrator.healthMonitor.getSummary();
       } else {
         const providers = fastify.providerService.getProviders();
         result.providers = providers.map((p: any) => ({
           name: p.name,
+          status: healthMap[p.name] === false ? 'down' : 'healthy',
           enabled: p.enabled !== false,
           models: p.models?.length || 0,
         }));
       }
     } catch (e: any) {
-      result.providers = { error: e.message };
+      result.providers = [];
     }
 
     // 8. Audit Logger
@@ -1419,6 +1497,7 @@ export const registerApiRoutes = async (
     }
 
     result.responseTimeMs = Date.now() - startTime;
+    result.middleware = result.middleware || [];
     return result;
   });
 
@@ -1988,6 +2067,33 @@ export const registerApiRoutes = async (
     }
   });
 
+  // Get detailed chain template by name
+  fastify.get('/api/chain/templates/:name', async (req: any, reply: any) => {
+    try {
+      const { getReasoningChainEngine } = require('../engines/reasoning-chain');
+      const dummyUpstream = async () => ({ content: '', inputTokens: 0, outputTokens: 0 });
+      const engine = getReasoningChainEngine(dummyUpstream, req.log);
+      const template = engine.getTemplate(req.params.name);
+      if (!template) {
+        return reply.code(404).send({ error: `Template '${req.params.name}' not found`, available: engine.listTemplates().map(t => t.name) });
+      }
+      // Serialize steps (systemPrompt functions → description)
+      const steps = template.steps.map(s => ({
+        id: s.id,
+        role: s.role,
+        model: s.model,
+        provider: s.provider,
+        maxTokens: s.maxTokens,
+        timeout: s.timeout,
+        systemPromptType: typeof s.systemPrompt === 'function' ? 'dynamic' : 'static',
+        systemPrompt: typeof s.systemPrompt === 'string' ? s.systemPrompt : undefined,
+      }));
+      reply.send({ ...template, steps });
+    } catch (e: any) {
+      reply.code(503).send({ error: e.message });
+    }
+  });
+
   fastify.get('/api/mirror/stats', async (req: any, reply: any) => {
     try {
       const { getTrafficMirror } = require('../utils/traffic-mirror');
@@ -2064,6 +2170,27 @@ export const registerApiRoutes = async (
     }
   });
 
+  // Comprehensive security scan using the SecurityScanner
+  fastify.post('/api/security/scan-diff', async (req: any, reply: any) => {
+    try {
+      const { SecurityScanner } = require('../utils/security-scanner');
+      const scanner = new SecurityScanner();
+      const { content, filePath } = req.body;
+      if (!content) {
+        return reply.code(400).send({ error: 'content body field required' });
+      }
+      const findings = scanner.scanString(content, filePath || 'uploaded-content');
+      const report = scanner.generateReport(findings, 1, 0);
+      reply.send({
+        hasLeaks: findings.length > 0,
+        findings,
+        report,
+      });
+    } catch (e: any) {
+      reply.code(500).send({ error: e.message });
+    }
+  });
+
   // =========================================================================
   // PHASE 3 ROUTES: FallbackChain, RAG Pipeline, AdaptiveParams, RateLimiter
   // =========================================================================
@@ -2097,9 +2224,27 @@ export const registerApiRoutes = async (
     try {
       const { getRAGPipeline } = require('../utils/rag-pipeline');
       const pipeline = getRAGPipeline(undefined, req.log);
-      reply.send(pipeline.getStats());
+      if (!pipeline.getStats().initialized) {
+        await pipeline.initialize();
+      }
+      const stats = pipeline.getStats();
+      reply.send({
+        available: stats.initialized === true,
+        embedding_service: stats.initialized ? `ollama/${stats.ollamaModel || 'nomic-embed-text'}` : 'disconnected',
+        vector_store: stats.initialized ? `qdrant/${stats.collection || 'ccr_rag'}` : 'disconnected',
+        collections: stats.collections || 0,
+        total_documents: stats.totalDocuments || 0,
+        ...stats,
+      });
     } catch (e: any) {
-      reply.code(503).send({ error: e.message });
+      reply.send({
+        available: false,
+        embedding_service: 'unavailable',
+        vector_store: 'unavailable',
+        collections: 0,
+        total_documents: 0,
+        error: e.message,
+      });
     }
   });
 
@@ -2107,11 +2252,12 @@ export const registerApiRoutes = async (
     try {
       const { getRAGPipeline } = require('../utils/rag-pipeline');
       const pipeline = getRAGPipeline(undefined, req.log);
-      const { content, source, tags } = req.body;
-      if (!content || !source) {
-        return reply.code(400).send({ error: 'content and source are required' });
+      if (!pipeline.getStats().initialized) await pipeline.initialize();
+      const { content, collection, source, tags } = req.body;
+      if (!content) {
+        return reply.code(400).send({ error: 'content is required' });
       }
-      const ids = await pipeline.ingestDocument({ content, source, tags: tags || [] });
+      const ids = await pipeline.ingestDocument({ content, source: source || collection || 'default', tags: tags || [] });
       reply.send({ success: true, chunks: ids.length, ids });
     } catch (e: any) {
       reply.code(500).send({ error: e.message });
@@ -2122,12 +2268,14 @@ export const registerApiRoutes = async (
     try {
       const { getRAGPipeline } = require('../utils/rag-pipeline');
       const pipeline = getRAGPipeline(undefined, req.log);
-      const { text, tags, source } = req.body;
-      if (!text) {
-        return reply.code(400).send({ error: 'text is required' });
+      if (!pipeline.getStats().initialized) await pipeline.initialize();
+      const { query, text, tags, source, limit } = req.body;
+      const searchText = query || text;
+      if (!searchText) {
+        return reply.code(400).send({ error: 'query is required' });
       }
-      const results = await pipeline.query(text, { tags, source });
-      reply.send({ results, count: results.length });
+      const results = await pipeline.query(searchText, { tags, source, limit: limit || 5 });
+      reply.send(results || []);
     } catch (e: any) {
       reply.code(500).send({ error: e.message });
     }
@@ -2252,4 +2400,18 @@ function sanitizeProvider(provider: any): any {
       : '***';
   }
   return sanitized;
+}
+
+function sanitizeProviders(providers: any[] | Record<string, any>): any {
+  if (Array.isArray(providers)) {
+    return providers.map(sanitizeProvider);
+  }
+  if (typeof providers === 'object' && providers !== null) {
+    const result: Record<string, any> = {};
+    for (const [key, value] of Object.entries(providers)) {
+      result[key] = sanitizeProvider(value);
+    }
+    return result;
+  }
+  return providers;
 }

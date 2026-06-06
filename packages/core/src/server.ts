@@ -36,6 +36,8 @@ import { sessionUsageCache } from "./utils/cache";
 import { resolveReasoningEffort } from "./utils/thinking";
 import { MiddlewareOrchestrator } from "./middleware/orchestrator";
 import { acquireConcurrencySlots, releaseWhenResponseCompletes } from "./utils/concurrency";
+import { getStructuredLogger, setStructuredLogger, StructuredLogger } from "./utils/structured-logger";
+import { RequestLifecycleLogger } from "./utils/request-lifecycle";
 
 // Extend FastifyRequest to include custom properties
 declare module "fastify" {
@@ -170,6 +172,99 @@ class Server {
         fastify.decorate('transformerService', this.transformerService);
         fastify.decorate('providerService', this.providerService);
         fastify.decorate('tokenizerService', this.tokenizerService);
+
+        // Register router preHandler hook INSIDE the plugin scope
+        // so it applies to /v1/messages route registered by registerApiRoutes
+        fastify.addHook("preHandler", (req: any, reply: any, done: any) => {
+          const url = new URL(`http://127.0.0.1${req.url}`);
+          const isLLMEndpoint = url.pathname === "/v1/messages" || url.pathname === "/v1/chat/completions";
+          if (isLLMEndpoint && req.body) {
+            const body = req.body as any;
+            req.log.info({ data: body, type: "request body" });
+            if (!body.stream) {
+              body.stream = false;
+            }
+          }
+          done();
+        });
+
+        fastify.addHook("preHandler", async (req: any, reply: any) => {
+          const url = new URL(`http://127.0.0.1${req.url}`);
+          const isLLMEndpoint = url.pathname === "/v1/messages" || url.pathname === "/v1/chat/completions";
+          if (isLLMEndpoint && req.body) {
+            try {
+              const body = req.body as any;
+
+              if (url.pathname === "/v1/chat/completions" && !body.system) {
+                const systemParts: Array<{ type: string; text: string }> = [];
+                for (const msg of (body.messages || [])) {
+                  if (msg.role === 'system') {
+                    const text = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+                    systemParts.push({ type: 'text', text });
+                  }
+                }
+                if (systemParts.length > 0) {
+                  body.system = systemParts;
+                }
+              }
+
+              await router(req, reply, {
+                configService: this.configService,
+                tokenizerService: this.tokenizerService,
+              });
+
+              if (reply.sent) {
+                return;
+              }
+              const routedBody = req.body as any;
+              if (!routedBody || !routedBody.model) {
+                return reply
+                  .code(400)
+                  .send({ error: "Missing model in request body" });
+              }
+              const [provider, ...model] = routedBody.model.split(",");
+              if (!provider || model.length === 0) {
+                return reply
+                  .code(400)
+                  .send({ error: `Invalid model format: ${routedBody.model}` });
+              }
+              routedBody.model = model.join(",");
+              req.provider = provider;
+              req.model = model.join(",");
+
+              if (url.pathname === "/v1/messages" && provider === "deepseek") {
+                const reasoning = resolveReasoningEffort(body);
+                if (reasoning.effort) {
+                  body.output_config = { effort: reasoning.effort };
+                } else {
+                  body.output_config = { effort: this.classifyThinkingEffort(body) };
+                }
+              }
+
+              const concurrencyConfig = this.configService.get('Concurrency');
+              if (concurrencyConfig && provider) {
+                try {
+                  const release = await acquireConcurrencySlots(provider, concurrencyConfig);
+                  req._releaseConcurrency = release;
+                } catch (err: any) {
+                  req.log.warn(`Concurrency limit reached for ${provider}: ${err.message}`);
+                  return reply.code(429).send({
+                    type: "error",
+                    error: {
+                      type: "rate_limit_error",
+                      message: `Too many concurrent requests to ${provider}. Please retry later.`
+                    }
+                  });
+                }
+              }
+              return;
+            } catch (err) {
+              req.log.error({error: err}, "Error in modelProviderMiddleware:");
+              return reply.code(500).send({ error: "Internal server error" });
+            }
+          }
+        });
+
         await registerApiRoutes(fastify);
       });
       return
@@ -219,83 +314,32 @@ class Server {
     try {
       this.app._server = this;
 
+      // Initialize structured logger with config-driven settings
+      const structuredLogger = new StructuredLogger({
+        level: this.configService.get('LOG_LEVEL') || 'info',
+        json: this.configService.get('LOG_FORMAT') !== 'text',
+        redactSensitive: true,
+      });
+      setStructuredLogger(structuredLogger);
+
+      // Register request lifecycle logging hooks
+      const lifecycleLogger = new RequestLifecycleLogger({
+        enabled: this.configService.get('LIFECYCLE_LOGGING_ENABLED') !== false,
+        includeTokens: true,
+        includeCost: true,
+      });
+      lifecycleLogger.register(this.app);
+
       // Initialize middleware orchestrator
       await this.orchestrator.initialize().catch((e: any) => {
         this.app.log.warn(`MiddlewareOrchestrator init skipped: ${e.message}`);
       });
 
-      this.app.addHook("preHandler", (req, reply, done) => {
-        const url = new URL(`http://127.0.0.1${req.url}`);
-        if (url.pathname === "/v1/messages" && req.body) {
-          const body = req.body as any;
-          req.log.info({ data: body, type: "request body" });
-          if (!body.stream) {
-            body.stream = false;
-          }
-        }
-        done();
-      });
-
       await this._initPromise;
+
+      // Register namespace — router hooks are INSIDE registerNamespace
+      // to avoid Fastify plugin encapsulation issues
       await this.registerNamespace('/')
-
-      this.app.addHook(
-        "preHandler",
-        async (req: FastifyRequest, reply: FastifyReply) => {
-          const url = new URL(`http://127.0.0.1${req.url}`);
-          if (url.pathname === "/v1/messages" && req.body) {
-            try {
-              const body = req.body as any;
-
-              await router(req as any, reply, {
-                configService: this.configService,
-                tokenizerService: this.tokenizerService,
-              });
-
-              if (reply.sent) return;
-              if (!body || !body.model) {
-                return reply
-                  .code(400)
-                  .send({ error: "Missing model in request body" });
-              }
-              const [provider, ...model] = body.model.split(",");
-              body.model = model.join(",");
-              req.provider = provider;
-              req.model = model.join(",");
-
-              if (provider === "deepseek") {
-                const reasoning = resolveReasoningEffort(body);
-                if (reasoning.effort) {
-                  body.output_config = { effort: reasoning.effort };
-                } else {
-                  body.output_config = { effort: this.classifyThinkingEffort(body) };
-                }
-              }
-
-              const concurrencyConfig = this.configService.get('Concurrency');
-              if (concurrencyConfig && provider) {
-                try {
-                  const release = await acquireConcurrencySlots(provider, concurrencyConfig);
-                  (req as any)._releaseConcurrency = release;
-                } catch (err: any) {
-                  req.log.warn(`Concurrency limit reached for ${provider}: ${err.message}`);
-                  return reply.code(429).send({
-                    type: "error",
-                    error: {
-                      type: "rate_limit_error",
-                      message: `Too many concurrent requests to ${provider}. Please retry later.`
-                    }
-                  });
-                }
-              }
-              return;
-            } catch (err) {
-              req.log.error({error: err}, "Error in modelProviderMiddleware:");
-              return reply.code(500).send({ error: "Internal server error" });
-            }
-          }
-        }
-      );
 
       // Orchestrator post-route hook (RAG enrichment + memory injection)
       this.app.addHook("preHandler", async (req: any) => {
@@ -304,9 +348,9 @@ class Server {
         }
       });
 
-      // Orchestrator post-response hook (cache store + context capture + memory extraction)
       this.app.addHook("onSend", async (req: any, reply: any, payload: any) => {
-        if (req.url?.includes("/v1/messages") && payload) {
+        const isLLMEndpoint = req.url?.includes("/v1/messages") || req.url?.includes("/v1/chat/completions");
+        if (isLLMEndpoint && payload) {
           try {
             if (typeof payload !== "string") return payload;
             const isSSE = payload.startsWith('event:') || payload.startsWith('data:');
@@ -327,7 +371,8 @@ class Server {
 
       // Orchestrator session start/end tracking
       this.app.addHook("onRequest", async (req: any) => {
-        if (req.url?.startsWith("/v1/messages")) {
+        const isLLMEndpoint = req.url?.startsWith("/v1/messages") || req.url?.startsWith("/v1/chat/completions");
+        if (isLLMEndpoint) {
           req._startTime = Date.now();
         }
       });
@@ -469,3 +514,7 @@ export { FallbackChainExecutor, getFallbackChainExecutor, FallbackResult, Fallba
 export { RAGPipeline, getRAGPipeline, RAGDocument, RAGQueryResult, RAGPipelineConfig } from "./utils/rag-pipeline";
 export { AdaptiveParameterTuner, getAdaptiveParameterTuner, AdaptiveParams } from "./utils/adaptive-params";
 export { RateLimiterQueue, getRateLimiterQueue, RateLimiterQueueConfig } from "./utils/rate-limiter-queue";
+export { StructuredLogger, getStructuredLogger, setStructuredLogger, withLogContext, withLogContextAsync, getLogContext, LogLevel, StructuredLogEntry, LoggerConfig } from "./utils/structured-logger";
+export { RequestLifecycleLogger, LifecycleConfig } from "./utils/request-lifecycle";
+export { SecurityScanner, SecurityFinding, ScanResult } from "./utils/security-scanner";
+export { validateConfig, ValidationError } from "./services/config-generator";

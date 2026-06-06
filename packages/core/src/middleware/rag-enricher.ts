@@ -17,7 +17,7 @@ import { readFile } from "fs/promises";
 import { existsSync } from "fs";
 import { join } from "path";
 import { getVectorStore } from "../utils/vector-store";
-import { getRedisCache } from "../utils/redis-cache";
+import { getEmbeddingService } from "../utils/embedding";
 
 export interface RAGConfig {
   enabled: boolean;
@@ -64,7 +64,14 @@ export class RAGEnricher extends EventEmitter {
 
   constructor(config: Partial<RAGConfig> = {}, private logger?: any) {
     super();
-    this.config = { ...DEFAULT_CONFIG, ...config };
+    this.config = {
+      ...DEFAULT_CONFIG,
+      ...config,
+      sources: { ...DEFAULT_CONFIG.sources, ...(config.sources || {}) },
+    };
+    if (typeof (this.config as any).projectRoot === 'undefined') {
+      delete (this.config as any).projectRoot;
+    }
   }
 
   /**
@@ -296,16 +303,17 @@ export class RAGEnricher extends EventEmitter {
       const query = context.query || context.taskType || context.agentName || "";
       if (!query || query.length < 3) return null;
 
-      const collection = this.config.vectorStoreCollection || "rag_documents";
-      const results = await vectorStore.search(collection, query, {
-        limit: 5,
-        scoreThreshold: 0.6,
-      });
+      const embeddingService = getEmbeddingService();
+      const queryVector = await embeddingService.embed(query);
+      if (!queryVector || queryVector.length === 0) return null;
+
+      const results = await vectorStore.search(queryVector, 5);
 
       if (!results || results.length === 0) return null;
 
       return results
-        .map((r: any, i: number) => `[${i + 1}] ${r.text || r.content || JSON.stringify(r.payload || r)}`)
+        .filter((r: any) => (r.score || 0) >= 0.6)
+        .map((r: any, i: number) => `[${i + 1}] ${r.payload?.text || r.payload?.content || JSON.stringify(r.payload || r)}`)
         .join("\n");
     } catch (e: any) {
       this.logger?.debug(`RAGEnricher vector store query failed: ${e?.message}`);

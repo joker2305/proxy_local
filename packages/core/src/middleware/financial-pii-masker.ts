@@ -29,7 +29,7 @@ export class FinancialPIIMasker {
   private patterns: MaskPattern[];
   private stats = { masked: 0, itemsMasked: 0 };
 
-  constructor(config: FinancialPIIMaskerConfig) {
+  constructor(config: FinancialPIIMaskerConfig, private logger?: any) {
     this.config = config;
     const enabledPatterns = config.patterns ?? ALL_PATTERN_NAMES;
 
@@ -105,7 +105,8 @@ export class FinancialPIIMasker {
     }
 
     const globalMaskMap = new Map<string, string>();
-    const cloned = JSON.parse(JSON.stringify(body));
+    let cloned: any;
+    try { cloned = JSON.parse(JSON.stringify(body)); } catch { cloned = body; }
 
     if (typeof cloned.system === "string") {
       const result = this.mask(cloned.system);
@@ -135,6 +136,6 @@ export class FinancialPIIMasker {
   }
 
   getStats() {
-    return { ...this.stats, patterns: this.patterns.map((p) => p.name) };
+    return { ...this.stats, patterns: this.patterns.map((p) => p.name), enabled: this.config.enabled };
   }
 }

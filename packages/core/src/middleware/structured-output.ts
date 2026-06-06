@@ -6,7 +6,7 @@ export class StructuredOutputEnforcer {
   private config: StructuredOutputConfig;
   private stats = { enforced: 0, extracted: 0, failed: 0 };
 
-  constructor(config: StructuredOutputConfig) {
+  constructor(config: StructuredOutputConfig, private logger?: any) {
     this.config = config;
   }
 
@@ -88,7 +88,7 @@ export class StructuredOutputEnforcer {
   }
 
   getStats() {
-    return { ...this.stats };
+    return { ...this.stats, enabled: this.config.enabled };
   }
 
   private extractContent(responseBody: any): string | null {
@@ -98,7 +98,8 @@ export class StructuredOutputEnforcer {
   }
 
   private replaceContent(responseBody: any, newContent: string): any {
-    const clone = JSON.parse(JSON.stringify(responseBody));
+    let clone: any;
+    try { clone = JSON.parse(JSON.stringify(responseBody)); } catch { clone = responseBody; }
     if (clone?.choices?.[0]?.message) {
       clone.choices[0].message.content = newContent;
     }
