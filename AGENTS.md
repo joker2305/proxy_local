@@ -156,7 +156,26 @@ Created full OpenCode toolchain based on:
 - Comparison of CCR's transformer pipeline against Anthropic spec and claw-code patterns
 - Research of LiteLLM, Portkey, OneAPI for architectural reference
 
-### Round 2 Context (commit pending)
+### Custom Plugin (`.opencode/plugins/`)
+
+| Plugin | Purpose |
+|--------|---------|
+| `ccr-plugin.js` | Build dependency auto-injection (ensures shared/core built before server); session compaction context preservation |
+
+### Configuration
+
+- **`opencode.example.jsonc`** — Template for project-level OpenCode config (copy to `opencode.jsonc`, fill in models/provider keys)
+- **`opencode.json`/`opencode.jsonc`** are gitignored (contain API keys)
+
+### Round 1 Context (commit 2e1712b)
+
+Created full OpenCode toolchain based on:
+- Deep analysis of claw-code Rust implementation (anthropic.rs, openai_compat.rs, sse.rs, mod.rs)
+- OpenCode official docs (skills, agents, commands, plugins formats)
+- Comparison of CCR's transformer pipeline against Anthropic spec and claw-code patterns
+- Research of LiteLLM, Portkey, OneAPI for architectural reference
+
+### Round 2 Context (commit fdf5fdd)
 
 Expanded analysis to broader AI agent ecosystem:
 - **Aider**: Architect/Editor multi-model pattern, per-model edit format YAML (6 formats), litellm universal provider layer, repo map (tree-sitter graph ranking), infinite output via prefill, cache keepalive pings
@@ -164,3 +183,10 @@ Expanded analysis to broader AI agent ecosystem:
 - **Cline**: TypeScript SDK, `@cline/llms` handler factory + registry pattern, tool approval policies, plugin system with lifecycle hooks
 - **Cursor**: Closed-source but model switching per task, worktrees for parallel agents, rules system
 - Key cross-cutting patterns: `provider/model` model ID convention (all tools), prompt-based editing vs function calling (Aider avoids function calling), per-model streaming/capability flags
+
+### Round 3 Context (commit pending)
+
+Completed the toolchain with operational tooling:
+- **ccr-plugin.js**: `tool.execute.before` hook auto-injects `pnpm build:shared && pnpm build:core` when missing before `pnpm build`; `experimental.session.compacting` hook preserves CCR architecture context across compaction
+- **opencode.example.jsonc**: Full project config template with build/plan agents, CCR provider config, bash permission rules, skill/task permissions, watcher ignore patterns
+- All 5 skills, 4 agents, 4 commands, 1 plugin, 1 config template now complete
