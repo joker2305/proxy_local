@@ -182,6 +182,13 @@ Created full OpenCode toolchain based on:
 | `ccr-routing-plugin.js` | CCR routing awareness: discovers available providers/models from CCR, injects model info during compaction, tracks session lifecycle |
 | `ccr-tools-plugin.js` | Custom OpenCode tools (`ccr_search`, `ccr_store`) for direct LLM access to CCR semantic store |
 
+### Custom Tools (`.opencode/tools/`)
+
+| Tool | Purpose |
+|------|---------|
+| `ccr_search.js` | Search CCR semantic store for project context (standalone tool, not plugin-dependent) |
+| `ccr_store.js` | Store context in CCR semantic store for future retrieval (standalone tool) |
+
 ### Configuration
 
 - **`opencode.example.jsonc`** — Template for project-level OpenCode config (copy to `opencode.jsonc`, fill in models/provider keys)
