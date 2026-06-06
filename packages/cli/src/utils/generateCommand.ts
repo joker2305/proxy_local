@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { resolve } from "path";
 import { homedir } from "os";
-import { generateCcrConfig } from "../../core/src/services/config-generator";
+import { generateCcrConfig } from "@musistudio/llms";
 import { CONFIG_FILE } from "@CCR/shared";
 
 export async function handleGenerateCommand(args: string[]): Promise<void> {

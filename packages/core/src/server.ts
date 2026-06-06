@@ -365,8 +365,9 @@ class Server {
 
       process.on("SIGINT", () => shutdown("SIGINT"));
       process.on("SIGTERM", () => shutdown("SIGTERM"));
-    } catch (error) {
-      this.app.log.error(`Error starting server: ${error}`);
+    } catch (error: any) {
+      console.error(`Error starting server: ${error?.message || error}`);
+      console.error(error?.stack);
       process.exit(1);
     }
   }
@@ -411,6 +412,7 @@ export { ProviderService } from "./services/provider";
 export { TransformerService } from "./services/transformer";
 export { TokenizerService } from "./services/tokenizer";
 export { SemanticStoreService } from "./services/semantic-store";
+export { generateCcrConfig } from "./services/config-generator";
 export { MiddlewareOrchestrator } from "./middleware/orchestrator";
 export { ReasoningCache } from "./middleware/reasoning-cache";
 export { pluginManager, tokenSpeedPlugin, getTokenSpeedStats, getGlobalTokenSpeedStats, CCRPlugin, CCRPluginOptions, PluginMetadata } from "./plugins";
@@ -418,6 +420,7 @@ export { SSEParserTransform, SSESerializerTransform, rewriteStream } from "./uti
 export { getCircuitBreaker, getAllCircuitBreakers, CircuitState, CircuitBreaker } from "./utils/circuit-breaker";
 export { withRetry, getRetryConfig, RetryConfig, RetryContext } from "./utils/retry";
 export { getMetrics, MetricsRegistry, MODEL_COST_TABLE } from "./utils/metrics";
+export { getModelLimits, MODEL_LIMITS, DEFAULT_MODEL_LIMITS, ModelLimits } from "./utils/model-limits";
 export { getRateLimiter, RateLimiter, RateLimiterConfig } from "./utils/rate-limiter";
 export { redactString, redactObject, containsSensitiveInfo, RedactorConfig } from "./utils/redactor";
 export { getBudgetManager, BudgetManager, BudgetConfig, BudgetAlert } from "./utils/budget";
