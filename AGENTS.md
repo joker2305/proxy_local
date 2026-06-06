@@ -264,3 +264,11 @@ MCP endpoint (`/api/mcp`) enhanced:
 - Full JSON-RPC 2.0 compliance with proper error codes
 
 This completes the transition from "CCR as black-box gateway" to "CCR as transparent proxy + opt-in context service for OpenCode".
+
+### Round 6 Context — Config & Protocol Cleanup (commit 02299a4+)
+
+- Updated `opencode.example.jsonc` with MCP server config + example models for DeepSeek/GLM/Gemini/GPT-4o
+- Fixed stale protocol gaps (marked `/v1/models` and `/v1/messages/count_tokens` as fixed)
+- Verified `/v1/chat/completions` endpoint registered via `openai.transformer.ts` — works for OpenCode's `@ai-sdk/openai-compatible`
+- All 3 commits (Round 4-6) total: 9 files changed, 809 insertions, 149 deletions
+- 353/354 tests pass (1 pre-existing config-generator failure unrelated to changes)
