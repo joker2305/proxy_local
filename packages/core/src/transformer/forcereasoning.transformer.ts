@@ -94,13 +94,14 @@ export class ForceReasoningTransformer implements Transformer {
 
       const decoder = new TextDecoder();
       const encoder = new TextEncoder();
+      const logger = this.logger;
 
       const stream = new ReadableStream({
         async start(controller) {
           const reader = response.body!.getReader();
           let lineBuffer = "";
 
-          let fsmState: "SEARCHING" | "REASONING" | "FINAL" = "SEARCHING";
+          let fsmState: string = "SEARCHING";
           let tagBuffer = "";
           let finalBuffer = "";
 
@@ -300,13 +301,13 @@ export class ForceReasoningTransformer implements Transformer {
               }
             }
           } catch (error) {
-            console.error("Stream error:", error);
+            logger?.error("Stream error:", error);
             controller.error(error);
           } finally {
             try {
               reader.releaseLock();
             } catch (e) {
-              console.error("Error releasing reader lock:", e);
+              logger?.error("Error releasing reader lock:", e);
             }
 
             if (fsmState === "REASONING") {

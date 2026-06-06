@@ -8,6 +8,8 @@ import { LRUCache } from "lru-cache";
 import { ConfigService } from "../services/config";
 import { TokenizerService } from "../services/tokenizer";
 import { resolveModelAlias } from "./model-alias";
+import { resolveTier, resolveScenarioModel } from "./tier-resolver";
+import type { TierResolution } from "./tier-resolver";
 import { analyzeReasoning, buildContextInjection } from "../engines/reasoning-engine";
 import { getAdaptiveRouter } from "./adaptive-router";
 import { getAdaptiveParameterTuner } from "./adaptive-params";
@@ -164,15 +166,32 @@ const getUseModel = async (
     }
   }
 
-  // Try model alias resolution (e.g. "opus" → "claude-opus-4-6", then config overrides)
+  // === Tier-based routing: interpret Claude model names as tier indicators ===
+  // Instead of a static ModelAlias mapping, resolve the model name to a tier
+  // (premium/standard/fast) and let scenario routing pick the best model.
+  // Falls back to ModelAlias when no tier config exists (backward compatible).
+  let tierResolution: TierResolution | null = null;
+
   if (!req.body.model.includes(",")) {
-    const aliasTarget = resolveModelAlias(req.body.model, configService);
-    if (aliasTarget) {
-      req.log.info(`Model alias resolved: ${req.body.model} → ${aliasTarget}`);
-      req.body.model = aliasTarget;
+    // 1. Try tier resolution first
+    tierResolution = resolveTier(req.body.model, configService);
+
+    if (tierResolution) {
+      (req as any)._tierResolution = tierResolution;
+      req.log.info(`Tier resolved: ${req.body.model} → tier=${tierResolution.tier}`);
+      // Do NOT set model — fall through to scenario routing below
+    } else {
+      // 2. Fall back to traditional ModelAlias (backward compatible)
+      const aliasTarget = resolveModelAlias(req.body.model, configService);
+      if (aliasTarget) {
+        req.log.info(`Model alias resolved: ${req.body.model} → ${aliasTarget}`);
+        req.body.model = aliasTarget;
+      }
     }
   }
 
+  // If model is now a fully-qualified "provider,model" string (from explicit
+  // client format, slash-prefix, or legacy ModelAlias), return immediately.
   if (req.body.model.includes(",")) {
     const [provider, model] = req.body.model.split(",");
     const providerLower = provider.toLowerCase();
@@ -196,38 +215,49 @@ const getUseModel = async (
     lastUsage.input_tokens > longContextThreshold &&
     tokenCount > 20000;
   const tokenCountThreshold = tokenCount > longContextThreshold;
-  if ((lastUsageThreshold || tokenCountThreshold) && Router?.longContext) {
-    req.log.info(
-      `Using long context model due to token count: ${tokenCount}, threshold: ${longContextThreshold}`
-    );
-    return { model: Router.longContext, scenarioType: 'longContext' };
+  if ((lastUsageThreshold || tokenCountThreshold)) {
+    const model = resolveScenarioModel(tierResolution, 'longContext', Router?.longContext);
+    if (model) {
+      req.log.info(
+        `Using long context model due to token count: ${tokenCount}, threshold: ${longContextThreshold} (tier=${tierResolution?.tier || 'none'})`
+      );
+      return { model, scenarioType: 'longContext' };
+    }
   }
   const subagentModel = extractSubagentModel(req);
   if (subagentModel) {
     return { model: subagentModel, scenarioType: 'default' };
   }
-  // Use the background model for any Claude Haiku variant
+  // Use the background model for any Claude Haiku variant or fast tier
   const globalRouter = configService.get("Router");
-  if (
-    req.body.model?.includes("claude") &&
-    req.body.model?.includes("haiku") &&
-    globalRouter?.background
-  ) {
-    req.log.info(`Using background model for ${req.body.model}`);
-    return { model: globalRouter.background, scenarioType: 'background' };
+  const modelName = (req.body.model || '').toLowerCase();
+  const isHaikuOrFastTier = tierResolution?.tier === 'fast' ||
+    modelName.includes("haiku") ||
+    modelName === 'fast';
+  if (isHaikuOrFastTier) {
+    const model = resolveScenarioModel(tierResolution, 'background', globalRouter?.background);
+    if (model) {
+      req.log.info(`Using background model for ${req.body.model} (tier=${tierResolution?.tier || 'none'})`);
+      return { model, scenarioType: 'background' };
+    }
   }
   // The priority of websearch must be higher than thinking.
   if (
     Array.isArray(req.body.tools) &&
-    req.body.tools.some((tool: any) => tool.type?.startsWith("web_search")) &&
-    Router?.webSearch
+    req.body.tools.some((tool: any) => tool.type?.startsWith("web_search"))
   ) {
-    return { model: Router.webSearch, scenarioType: 'webSearch' };
+    const model = resolveScenarioModel(tierResolution, 'webSearch', Router?.webSearch);
+    if (model) {
+      return { model, scenarioType: 'webSearch' };
+    }
   }
   // if exits thinking, use the think model
-  if (req.body.thinking && Router?.think) {
-    req.log.info(`Using think model for ${req.body.thinking}`);
-    return { model: Router.think, scenarioType: 'think' };
+  if (req.body.thinking) {
+    const model = resolveScenarioModel(tierResolution, 'think', Router?.think);
+    if (model) {
+      req.log.info(`Using think model for ${JSON.stringify(req.body.thinking)} (tier=${tierResolution?.tier || 'none'})`);
+      return { model, scenarioType: 'think' };
+    }
   }
 
   // ====================================================================
@@ -244,6 +274,18 @@ const getUseModel = async (
         const classification = classifyRequest(lastMessage, undefined, tokenCount);
         (req as any)._taskClassification = classification;
 
+        // Tier-aware simple task downgrade: use cheaper model for simple tasks
+        if (tierResolution && classification.category === 'SIMPLE' && classification.confidence >= 0.55) {
+          const simpleModel = resolveScenarioModel(tierResolution, 'simple', undefined);
+          if (simpleModel) {
+            req.log.info(
+              `Tier downgrade: ${tierResolution.tier}/simple task ` +
+              `(score=${classification.score.toFixed(3)}) → ${simpleModel}`
+            );
+            return { model: simpleModel, scenarioType: 'strategy_selected' };
+          }
+        }
+
         if (classification.confidence >= 0.55) {
           const strategyManager = getThinkingStrategyManager(req.log);
           const providers = configService.get<any[]>('providers') || [];
@@ -254,6 +296,7 @@ const getUseModel = async (
             classification.category,
             tokenCount,
           );
+
 
           // Apply strategy params (thinking config, temperature, etc.)
           req.body = strategyManager.applyParams(req.body, selection.strategy);
@@ -279,29 +322,34 @@ const getUseModel = async (
     }
   }
 
-  return { model: Router?.default, scenarioType: 'default' };
+  // Default fallback: tier-aware or Router default
+  const defaultModel = resolveScenarioModel(tierResolution, 'default', Router?.default);
+  return { model: defaultModel, scenarioType: 'default' };
 };
 
 const extractSubagentModel = (req: any): string | undefined => {
-  if (
-    !Array.isArray(req.body?.system) ||
-    req.body.system.length <= 1 ||
-    typeof req.body.system[1]?.text !== "string" ||
-    !req.body.system[1].text.startsWith("<CCR-SUBAGENT-MODEL>")
-  ) {
+  if (!Array.isArray(req.body?.system)) {
     return undefined;
   }
 
-  const model = req.body.system[1].text.match(
-    /<CCR-SUBAGENT-MODEL>(.*?)<\/CCR-SUBAGENT-MODEL>/s
-  );
-  if (!model) return undefined;
+  // Scan all system blocks for CCR-SUBAGENT-MODEL tag (not just system[1])
+  for (let i = 0; i < req.body.system.length; i++) {
+    const block = req.body.system[i];
+    if (typeof block?.text !== "string") continue;
 
-  req.body.system[1].text = req.body.system[1].text.replace(
-    `<CCR-SUBAGENT-MODEL>${model[1]}</CCR-SUBAGENT-MODEL>`,
-    ""
-  );
-  return model[1];
+    const match = block.text.match(
+      /<CCR-SUBAGENT-MODEL>(.*?)<\/CCR-SUBAGENT-MODEL>/s
+    );
+    if (match) {
+      // Remove the tag from the system block
+      req.body.system[i].text = block.text.replace(
+        `<CCR-SUBAGENT-MODEL>${match[1]}</CCR-SUBAGENT-MODEL>`,
+        ""
+      );
+      return match[1];
+    }
+  }
+  return undefined;
 };
 
 export interface RouterContext {
@@ -599,9 +647,7 @@ export const searchProjectBySession = async (
     // Cache not found result (null value means previously searched but not found)
     sessionProjectCache.set(sessionId, '');
     return null; // No matching project found
-  } catch (error) {
-    console.error("Error searching for project by session:", error);
-    // Cache null result on error to avoid repeated errors
+  } catch {
     sessionProjectCache.set(sessionId, '');
     return null;
   }

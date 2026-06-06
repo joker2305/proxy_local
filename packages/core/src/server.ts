@@ -35,7 +35,7 @@ import { router, calculateTokenCount, searchProjectBySession } from "./utils/rou
 import { sessionUsageCache } from "./utils/cache";
 import { resolveReasoningEffort } from "./utils/thinking";
 import { MiddlewareOrchestrator } from "./middleware/orchestrator";
-import { acquireConcurrencySlots, releaseWhenResponseCompletes } from "./utils/concurrency";
+import { acquireConcurrencySlots } from "./utils/concurrency";
 import { getStructuredLogger, setStructuredLogger, StructuredLogger } from "./utils/structured-logger";
 import { RequestLifecycleLogger } from "./utils/request-lifecycle";
 
@@ -343,9 +343,9 @@ class Server {
 
       // Orchestrator post-route hook (RAG enrichment + memory injection)
       this.app.addHook("preHandler", async (req: any) => {
-        if (req.provider && req.scenarioType) {
-          await this.orchestrator.onPostRoute(req).catch(() => {});
-        }
+        if ((req as any)._orchestrated || !req.provider || !req.scenarioType) return;
+        (req as any)._orchestrated = true;
+        await this.orchestrator.onPostRoute(req).catch(() => {});
       });
 
       this.app.addHook("onSend", async (req: any, reply: any, payload: any) => {
@@ -381,12 +381,19 @@ class Server {
         if (!req._releaseConcurrency) return;
         const release = req._releaseConcurrency;
         delete req._releaseConcurrency;
+        let released = false;
+        const safeRelease = () => {
+          if (!released) {
+            released = true;
+            release();
+          }
+        };
         const raw = reply.raw;
         if (raw && !raw.writableEnded && !raw.finished) {
-          raw.once("close", () => release());
-          raw.once("error", () => release());
+          raw.once("close", () => safeRelease());
+          raw.once("error", () => safeRelease());
         } else {
-          release();
+          safeRelease();
         }
       });
 

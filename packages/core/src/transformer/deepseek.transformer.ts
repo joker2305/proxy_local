@@ -22,6 +22,17 @@ export class DeepseekTransformer implements Transformer {
   async transformRequestIn(request: UnifiedChatRequest): Promise<UnifiedChatRequest> {
     const model = request.model || '';
 
+    // Echo prior thinking as reasoning_content in assistant messages for multi-turn context
+    // DeepSeek V4 requires reasoning_content in message history for coherent multi-turn reasoning
+    if (isDeepseekThinkingModel(model) && request.messages) {
+      for (const msg of request.messages) {
+        if (msg.role === 'assistant' && msg.thinking?.content) {
+          (msg as any).reasoning_content = msg.thinking.content;
+          // Do not delete msg.thinking - other transformers may still need it
+        }
+      }
+    }
+
     if (isDeepseekV4Pro(model)) {
       if (request.max_tokens && request.max_tokens > 384000) {
         request.max_tokens = 384000;
@@ -90,7 +101,7 @@ export class DeepseekTransformer implements Transformer {
         delete msg.reasoning_content;
 
         if (!msg.content || msg.content === "") {
-          console.log(`[DeepseekTransformer] reasoning-only response (${msg.thinking.content.length} chars)`);
+          // reasoning-only response - no content to forward
         }
       }
 
@@ -107,6 +118,7 @@ export class DeepseekTransformer implements Transformer {
       const decoder = new TextDecoder();
       const encoder = new TextEncoder();
       let buffer = "";
+      const logger = this.logger;
 
       const stream = new ReadableStream({
         async start(controller) {
@@ -199,19 +211,19 @@ export class DeepseekTransformer implements Transformer {
                 try {
                   processLine(line, controller, encoder);
                 } catch (error) {
-                  console.error("Error processing line:", line, error);
+                  logger?.error("Error processing line:", line, error);
                   controller.enqueue(encoder.encode(line + "\n"));
                 }
               }
             }
           } catch (error) {
-            console.error("Stream error:", error);
+            logger?.error("Stream error:", error);
             controller.error(error);
           } finally {
             try {
               reader.releaseLock();
             } catch (e) {
-              console.error("Error releasing reader lock:", e);
+              logger?.error("Error releasing reader lock:", e);
             }
             try { controller.close(); } catch {}
           }

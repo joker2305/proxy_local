@@ -221,21 +221,17 @@ export class ReasoningTransformer implements Transformer {
                     setReasoningComplete: (val) => (isReasoningComplete = val),
                   });
                 } catch (error) {
-                  console.error("Error processing line:", line, error);
                   // Pass through original line if parsing fails
                   controller.enqueue(encoder.encode(line + "\n"));
                 }
               }
             }
           } catch (error) {
-            console.error("Stream error:", error);
             controller.error(error);
           } finally {
             try {
               reader.releaseLock();
-            } catch (e) {
-              console.error("Error releasing reader lock:", e);
-            }
+            } catch {}
             controller.close();
           }
         },

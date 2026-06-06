@@ -1,6 +1,6 @@
-import Server, { calculateTokenCount, TokenizerService, SemanticStoreService } from "@musistudio/llms";
+import Server, { calculateTokenCount, TokenizerService, SemanticStoreService, MODEL_LIMITS, DEFAULT_MODEL_LIMITS } from "@musistudio/llms";
 import { readConfigFile, writeConfigFile, backupConfigFile } from "./utils";
-import { join } from "path";
+import path, { join } from "path";
 import fastifyStatic from "@fastify/static";
 import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, rmSync } from "fs";
 import { homedir } from "os";
@@ -111,6 +111,23 @@ export const createServer = async (config: any): Promise<any> => {
   app.post("/api/config", async (req: any, reply: any) => {
     const newConfig = req.body;
 
+    // Validate config before saving
+    try {
+      const { validateConfig } = require('@musistudio/llms');
+      if (typeof validateConfig === 'function') {
+        const issues = validateConfig(newConfig);
+        const errors = issues.filter((i: any) => i.severity === 'error');
+        if (errors.length > 0) {
+          return reply.code(400).send({
+            error: 'Config validation failed',
+            issues: errors,
+          });
+        }
+      }
+    } catch {
+      // Validation module not available, proceed
+    }
+
     // Backup existing config file if it exists
     const backupPath = await backupConfigFile();
     if (backupPath) {
@@ -119,6 +136,23 @@ export const createServer = async (config: any): Promise<any> => {
 
     await writeConfigFile(newConfig);
     return { success: true, message: "Config saved successfully" };
+  });
+
+  // Config validation endpoint
+  app.post("/api/config/validate", async (req: any, reply: any) => {
+    try {
+      const { validateConfig } = require('@musistudio/llms');
+      if (typeof validateConfig !== 'function') {
+        return reply.code(501).send({ error: 'Validation module not available' });
+      }
+      const issues = validateConfig(req.body);
+      return {
+        valid: issues.filter((i: any) => i.severity === 'error').length === 0,
+        issues,
+      };
+    } catch (e: any) {
+      return reply.code(500).send({ error: e.message });
+    }
   });
 
   // Register static file serving with caching
@@ -149,7 +183,7 @@ export const createServer = async (config: any): Promise<any> => {
 
             logFiles.push({
               name: file,
-              path: filePath,
+              path: path.basename(filePath),
               size: stats.size,
               lastModified: stats.mtime.toISOString()
             });
@@ -170,15 +204,17 @@ export const createServer = async (config: any): Promise<any> => {
   // Get log content endpoint
   app.get("/api/logs", async (req: any, reply: any) => {
     try {
+      const logDir = path.resolve(join(homedir(), ".claude-code-router", "logs"));
       const filePath = (req.query as any).file as string;
       let logFilePath: string;
 
       if (filePath) {
-        // If file path is specified, use the specified path
-        logFilePath = filePath;
+        logFilePath = path.resolve(logDir, filePath);
+        if (!logFilePath.startsWith(logDir)) {
+          return reply.code(403).send({ error: 'Invalid file path' });
+        }
       } else {
-        // If file path is not specified, use default log file path
-        logFilePath = join(homedir(), ".claude-code-router", "logs", "app.log");
+        logFilePath = join(logDir, "app.log");
       }
 
       if (!existsSync(logFilePath)) {
@@ -198,15 +234,17 @@ export const createServer = async (config: any): Promise<any> => {
   // Clear log content endpoint
   app.delete("/api/logs", async (req: any, reply: any) => {
     try {
+      const logDir = path.resolve(join(homedir(), ".claude-code-router", "logs"));
       const filePath = (req.query as any).file as string;
       let logFilePath: string;
 
       if (filePath) {
-        // If file path is specified, use the specified path
-        logFilePath = filePath;
+        logFilePath = path.resolve(logDir, filePath);
+        if (!logFilePath.startsWith(logDir)) {
+          return reply.code(403).send({ error: 'Invalid file path' });
+        }
       } else {
-        // If file path is not specified, use default log file path
-        logFilePath = join(homedir(), ".claude-code-router", "logs", "app.log");
+        logFilePath = join(logDir, "app.log");
       }
 
       if (existsSync(logFilePath)) {
@@ -648,8 +686,12 @@ export const createServer = async (config: any): Promise<any> => {
   // Diagnostic: test AnthropicTransformer conversion
   app.post("/api/debug/convert", async (req: any, reply: any) => {
     try {
-      const { provider: pName } = req.body;
       const srv = getServer(app);
+      const config = srv?.configService;
+      if (!config?.get('debug')?.enabled) {
+        return reply.code(404).send({ error: 'Not found' });
+      }
+      const { provider: pName } = req.body;
       const prov = srv?.providerService.getProvider(pName);
       if (!prov) return reply.code(404).send({ error: "Provider not found" });
       const url = new URL(prov.baseUrl);
@@ -684,6 +726,126 @@ export const createServer = async (config: any): Promise<any> => {
       };
     } catch (e: any) {
       return { error: e.message, stack: e.stack?.split('\n').slice(0,3) };
+    }
+  });
+
+  // --- Provider Model Discovery ---
+  app.get("/api/providers/:providerName/discover-models", async (req: any, reply: any) => {
+    try {
+      const { providerName } = req.params;
+      const config = await readConfigFile();
+      const providers = config.Providers || config.providers || [];
+      const provider = providers.find((p: any) => p.name === providerName);
+      if (!provider) {
+        return reply.code(404).send({ error: `Provider "${providerName}" not found` });
+      }
+
+      let modelsUrl: string;
+      let authHeader: string;
+      const baseUrl = provider.api_base_url || provider.apiKey || '';
+
+      if (providerName === 'glm') {
+        modelsUrl = 'https://open.bigmodel.cn/api/paas/v4/models';
+        authHeader = `Bearer ${provider.api_key || provider.apiKey}`;
+      } else if (providerName === 'deepseek') {
+        modelsUrl = 'https://api.deepseek.com/models';
+        authHeader = `Bearer ${provider.api_key || provider.apiKey}`;
+      } else if (baseUrl.includes('localhost:11434') || baseUrl.includes('127.0.0.1:11434')) {
+        modelsUrl = 'http://localhost:11434/v1/models';
+        authHeader = '';
+      } else {
+        const url = new URL(baseUrl);
+        modelsUrl = `${url.protocol}//${url.host}/v1/models`;
+        authHeader = `Bearer ${provider.api_key || provider.apiKey}`;
+      }
+
+      const headers: Record<string, string> = { 'Accept': 'application/json' };
+      if (authHeader) headers['Authorization'] = authHeader;
+
+      const resp = await fetch(modelsUrl, { headers, signal: AbortSignal.timeout(10000) });
+      if (!resp.ok) {
+        return reply.code(502).send({ error: `Upstream returned ${resp.status}`, modelsUrl });
+      }
+      const data = await resp.json() as any;
+      const rawModels: Array<{ id: string; object?: string; owned_by?: string; created?: number }> = data.data || data.models || [];
+
+      const discovered = rawModels.map((m: any) => {
+        const limits = (MODEL_LIMITS as Record<string, any>)[m.id] || DEFAULT_MODEL_LIMITS;
+        return {
+          id: m.id,
+          owned_by: m.owned_by || providerName,
+          contextWindow: limits.contextWindow,
+          maxOutputTokens: limits.maxOutputTokens,
+          supportsThinking: limits.supportsThinking || false,
+          thinkingBudgetTokens: limits.thinkingBudgetTokens || 0,
+        };
+      });
+
+      const configured = (provider.models || []).map((id: string) => {
+        const limits = (MODEL_LIMITS as Record<string, any>)[id] || DEFAULT_MODEL_LIMITS;
+        return {
+          id,
+          owned_by: providerName,
+          contextWindow: limits.contextWindow,
+          maxOutputTokens: limits.maxOutputTokens,
+          supportsThinking: limits.supportsThinking || false,
+          thinkingBudgetTokens: limits.thinkingBudgetTokens || 0,
+          configured: true,
+        };
+      });
+
+      const configuredIds = new Set(configured.map((m: any) => m.id));
+      const newModels = discovered.filter((m: any) => !configuredIds.has(m.id));
+
+      return { provider: providerName, configured, discovered: newModels, total: configured.length + newModels.length };
+    } catch (e: any) {
+      return reply.code(500).send({ error: e.message });
+    }
+  });
+
+  app.post("/api/providers/:providerName/models", async (req: any, reply: any) => {
+    try {
+      const { providerName } = req.params;
+      const { models } = req.body;
+      if (!Array.isArray(models)) {
+        return reply.code(400).send({ error: 'models must be an array of strings' });
+      }
+      const config = await readConfigFile();
+      const providers = config.Providers || config.providers || [];
+      const idx = providers.findIndex((p: any) => p.name === providerName);
+      if (idx === -1) {
+        return reply.code(404).send({ error: `Provider "${providerName}" not found` });
+      }
+      providers[idx].models = models;
+      await writeConfigFile(config);
+      return { success: true, provider: providerName, models };
+    } catch (e: any) {
+      return reply.code(500).send({ error: e.message });
+    }
+  });
+
+  app.get("/api/model-limits", async (req: any, reply: any) => {
+    try {
+      const config = await readConfigFile();
+      const providers = config.Providers || config.providers || [];
+      const allModels: Record<string, any> = {};
+
+      for (const [id, limits] of Object.entries(MODEL_LIMITS as Record<string, any>)) {
+        allModels[id] = { ...limits, provider: 'unknown' };
+      }
+
+      for (const p of providers) {
+        for (const m of (p.models || [])) {
+          if (!allModels[m]) {
+            allModels[m] = { ...DEFAULT_MODEL_LIMITS, provider: p.name };
+          }
+          allModels[m].provider = p.name;
+        }
+      }
+
+      return { models: allModels, defaultContextWindow: DEFAULT_MODEL_LIMITS.contextWindow };
+    } catch (e: any) {
+      return { models: {}, error: e.message };
     }
   });
 

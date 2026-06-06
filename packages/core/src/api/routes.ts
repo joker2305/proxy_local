@@ -910,9 +910,6 @@ export const registerApiRoutes = async (
       hasProviders: providers.length > 0,
       providerCount: providers.length,
       hasApiKey: apiKey.length > 0,
-      apiKeyHint: apiKey.length > 8
-        ? apiKey.slice(0, 4) + '***' + apiKey.slice(-4)
-        : (apiKey ? '***' : ''),
     };
   });
 

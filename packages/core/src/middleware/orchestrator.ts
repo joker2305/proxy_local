@@ -653,8 +653,6 @@ export class MiddlewareOrchestrator {
       if (wsPush && typeof (wsPush as any).shutdown === 'function') (wsPush as any).shutdown();
     } catch (e: any) { this.logger?.debug(`Shutdown WsPush: ${e?.message}`); }
 
-    this.initialized = false;
-
     if (this.trafficMirror) {
       this.trafficMirror.updateConfig({ enabled: false });
     }
@@ -666,6 +664,8 @@ export class MiddlewareOrchestrator {
     if (this.securityHardener) {
       this.securityHardener.destroy();
     }
+
+    this.initialized = false;
 
     this.logger.info("MiddlewareOrchestrator: shutdown (v2)");
   }

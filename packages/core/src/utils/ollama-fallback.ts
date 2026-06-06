@@ -109,7 +109,7 @@ export class OllamaFallback {
         role: 'assistant',
         content: [{ type: 'text', text: data.message?.content || '' }],
         model,
-        stop_reason: data.done_reason || 'end_turn',
+        stop_reason: (data.done_reason === 'stop' || data.done_reason === 'end_turn') ? 'end_turn' : (data.done_reason || 'end_turn'),
         stop_sequence: null,
         usage: {
           input_tokens: data.prompt_eval_count || 0,
@@ -138,6 +138,7 @@ export class OllamaFallback {
    */
   isEligible(body: any): boolean {
     if (!this.config.enabled) return false;
+    if (body?.stream) return false;
     if (body?.model?.includes('ollama')) return false;
     return true;
   }
