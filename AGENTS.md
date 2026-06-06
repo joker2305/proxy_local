@@ -78,8 +78,8 @@ The proxy exposes `POST /v1/messages` as its primary endpoint. It converts betwe
 ### Known Protocol Gaps (vs Anthropic spec and claw-code reference)
 
 1. **Error format**: Returns `{error: {message, type, code}}` instead of Anthropic's `{type: "error", error: {type, message}}`
-2. **No `/v1/models` endpoint**: Model listing not exposed
-3. **No `/v1/messages/count_tokens`**: Token counting endpoint missing
+2. ~~**No `/v1/models` endpoint**: Model listing not exposed~~ — **Fixed** in server.ts
+3. ~~**No `/v1/messages/count_tokens`**: Token counting endpoint missing~~ — **Fixed** in server.ts
 4. **Usage in `message_start`**: Always reports `input_tokens: 0` — real Anthropic includes input tokens here
 5. **Synthetic thinking signatures**: Non-Anthropic providers get fake signatures (timestamps), not cryptographic ones
 6. **No request validation**: Missing schema checks on required fields (`max_tokens`, `messages`, `model`)
