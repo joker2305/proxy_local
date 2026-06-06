@@ -104,7 +104,9 @@ OpenCode connects via custom provider with `@ai-sdk/openai-compatible`:
   }
 }
 ```
-Model IDs: `"ccr/deepseek,deepseek-chat"`. OpenCode expects OpenAI-compatible `/v1/chat/completions` — proxy needs both endpoints working.
+Model IDs: `"ccr/deepseek,deepseek-chat"`. OpenCode expects OpenAI-compatible `/v1/chat/completions` — proxy registers this via `openai.transformer.ts`.
+
+**Transformer compatibility**: The `/v1/chat/completions` path works natively with OpenAI-compatible providers (DeepSeek, Groq, OpenAI). Non-OpenAI providers (Gemini, GLM) are supported via their inner-layer transformers configured in CCR's `config.json`.
 
 CCR also exposes an MCP endpoint at `/api/mcp` for semantic search/store, and REST APIs at `/api/context/*` for OpenCode plugins.
 
