@@ -128,6 +128,7 @@ Claw Code (`D:\project\claw-code-main`) is a Rust reimplementation of Claude Cod
 | `transformer-dev` | Transformer interface, pipeline order, passthrough mode, all existing transformers |
 | `proxy-debug` | Request flow trace map, common failure patterns, debugging approaches |
 | `claw-code-compare` | Claw-code file map, priority comparison points, original Claude Code intelligence |
+| `agent-ecosystem` | AI coding agent architecture patterns (Aider/Crush/Cline/Cursor) for proxy design |
 
 ### Custom Agents (invoked via `@agent-name` or Task tool)
 
@@ -136,6 +137,7 @@ Claw Code (`D:\project\claw-code-main`) is a Rust reimplementation of Claude Cod
 | `protocol-compare` | subagent (read-only) | Gap analysis between claw-code and CCR for a specific feature |
 | `os-research` | subagent (read-only) | Research open-source LLM gateways for improvement patterns |
 | `pipeline-tracer` | subagent (read-only) | Trace full transformer pipeline for a specific provider/scenario |
+| `provider-compat` | subagent (read-only) | Analyze client tool (Aider/Crush/Cline/OpenCode) compatibility with CCR |
 
 ### Custom Commands
 
@@ -153,3 +155,12 @@ Created full OpenCode toolchain based on:
 - OpenCode official docs (skills, agents, commands, plugins formats)
 - Comparison of CCR's transformer pipeline against Anthropic spec and claw-code patterns
 - Research of LiteLLM, Portkey, OneAPI for architectural reference
+
+### Round 2 Context (commit pending)
+
+Expanded analysis to broader AI agent ecosystem:
+- **Aider**: Architect/Editor multi-model pattern, per-model edit format YAML (6 formats), litellm universal provider layer, repo map (tree-sitter graph ranking), infinite output via prefill, cache keepalive pings
+- **Crush (Charmbracelet)**: Go-based, dual protocol (`openai`/`openai-compat`/`anthropic` types), SQLite session persistence, agent skills standard (agentskills.io), local installation at `.crush/` with zai provider
+- **Cline**: TypeScript SDK, `@cline/llms` handler factory + registry pattern, tool approval policies, plugin system with lifecycle hooks
+- **Cursor**: Closed-source but model switching per task, worktrees for parallel agents, rules system
+- Key cross-cutting patterns: `provider/model` model ID convention (all tools), prompt-based editing vs function calling (Aider avoids function calling), per-model streaming/capability flags
