@@ -96,12 +96,27 @@ OpenCode connects via custom provider with `@ai-sdk/openai-compatible`:
     "ccr": {
       "npm": "@ai-sdk/openai-compatible",
       "options": { "baseURL": "http://localhost:4096/v1" },
-      "models": { "claude-sonnet-4-5": { "name": "Sonnet 4.5" } }
+      "models": {
+        "deepseek,deepseek-chat": { "name": "DeepSeek Chat (via CCR)" },
+        "gemini,gemini-2.5-pro": { "name": "Gemini 2.5 Pro (via CCR)" }
+      }
     }
   }
 }
 ```
-Model IDs: `"ccr/claude-sonnet-4-5"`. OpenCode expects OpenAI-compatible `/v1/chat/completions` — proxy needs both endpoints working.
+Model IDs: `"ccr/deepseek,deepseek-chat"`. OpenCode expects OpenAI-compatible `/v1/chat/completions` — proxy needs both endpoints working.
+
+CCR also exposes an MCP endpoint at `/api/mcp` for semantic search/store, and REST APIs at `/api/context/*` for OpenCode plugins.
+
+### Architecture Philosophy: CCR Serves OpenCode
+
+CCR is a **proxy and context service** for OpenCode, not a replacement for OpenCode's own routing/provider system:
+- **CCR core**: Transparent proxy (format transformation, caching, concurrency, circuit breaker)
+- **Context service**: Semantic store, context collection — exposed via REST API and MCP
+- **Routing**: OpenCode's own provider/model system handles this; CCR's router runs only when model format is `"providerName,modelName"`
+- **RAG/Memory injection**: Disabled by default in proxy; available via MCP tools for OpenCode to call explicitly
+- **OpenCode plugins** (`.opencode/plugins/`): Build dependency injection, compaction context, CCR semantic store queries
+- **OpenCode MCP** (`/api/mcp`): `semantic_search`, `semantic_store`, `health_check` tools
 
 ### Claw-Code Reference Intelligence
 
@@ -160,20 +175,13 @@ Created full OpenCode toolchain based on:
 
 | Plugin | Purpose |
 |--------|---------|
-| `ccr-plugin.js` | Build dependency auto-injection (ensures shared/core built before server); session compaction context preservation |
+| `ccr-plugin.js` | Build dependency auto-injection; session compaction context preservation with CCR semantic store query |
+| `ccr-context-plugin.js` | Full CCR context service integration: health check on init, semantic context injection during compaction, build dependency injection, session idle event handling |
 
 ### Configuration
 
 - **`opencode.example.jsonc`** — Template for project-level OpenCode config (copy to `opencode.jsonc`, fill in models/provider keys)
 - **`opencode.json`/`opencode.jsonc`** are gitignored (contain API keys)
-
-### Round 1 Context (commit 2e1712b)
-
-Created full OpenCode toolchain based on:
-- Deep analysis of claw-code Rust implementation (anthropic.rs, openai_compat.rs, sse.rs, mod.rs)
-- OpenCode official docs (skills, agents, commands, plugins formats)
-- Comparison of CCR's transformer pipeline against Anthropic spec and claw-code patterns
-- Research of LiteLLM, Portkey, OneAPI for architectural reference
 
 ### Round 2 Context (commit fdf5fdd)
 
@@ -190,3 +198,52 @@ Completed the toolchain with operational tooling:
 - **ccr-plugin.js**: `tool.execute.before` hook auto-injects `pnpm build:shared && pnpm build:core` when missing before `pnpm build`; `experimental.session.compacting` hook preserves CCR architecture context across compaction
 - **opencode.example.jsonc**: Full project config template with build/plan agents, CCR provider config, bash permission rules, skill/task permissions, watcher ignore patterns
 - All 5 skills, 4 agents, 4 commands, 1 plugin, 1 config template now complete
+
+### Round 4 Context — Architecture Evolution: CCR Serves OpenCode
+
+**Problem identified**: CCR was originally designed for Claude Code (black box). For OpenCode, CCR's transparent RAG/Memory/Session injection was overriding OpenCode's own provider/routing capabilities, making CCR "too smart" and removing user control.
+
+**Solution**: Separated CCR into two clean layers:
+1. **Transparent proxy core** (always on): Transformer pipeline, semantic cache, concurrency, circuit breaker, rate limiting, tool compression, prompt caching
+2. **Opt-in context services** (disabled by default, enabled via config): RAG enricher, memory bridge, context capture, reasoning cache, session bridge, evolution bridge
+
+**Changes in this round**:
+
+| File | Change |
+|------|--------|
+| `packages/core/src/middleware/orchestrator.ts` | RAG enricher, memory bridge, context capture, reasoning cache now default OFF (`=== true` instead of `!== false`). `onPostRoute` and `onPostResponse` check `middlewareConfig.*.enabled` before running |
+| `packages/server/src/server.ts` | Added `/api/context/store`, `/api/context/query`, `/api/context/stats`, `/api/context/collect` REST endpoints. Added `/api/mcp` MCP-compatible JSON-RPC endpoint with `semantic_search`, `semantic_store`, `health_check` tools |
+| `.opencode/plugins/ccr-plugin.js` | Updated: added CCR semantic store query during compaction |
+| `.opencode/plugins/ccr-context-plugin.js` | New: full CCR context integration plugin — health check on init, semantic context injection, session idle handling |
+| `examples/opencode-provider-config.json` | New: example OpenCode config showing CCR as `@ai-sdk/openai-compatible` provider + MCP server |
+| `AGENTS.md` | Added architecture philosophy section, updated plugin docs |
+
+**Config keys changed (from default-on to default-off)**:
+- `RAG_ENRICHER_ENABLED`: was `!== false` → now `=== true`
+- `MEMORY_BRIDGE_ENABLED`: was `!== false` → now `=== true`
+- `MEMORY_EXTRACTION_ENABLED`: was `!== false` → now `=== true`
+- `CONTEXT_CAPTURE_ENABLED`: was `!== false` → now `=== true`
+- `REASONING_CACHE_ENABLED`: unchanged (was already `=== true`)
+
+**To re-enable transparent injection**, add to `~/.claude-code-router/config.json`:
+```json
+{
+  "RAG_ENRICHER_ENABLED": true,
+  "MEMORY_BRIDGE_ENABLED": true,
+  "CONTEXT_CAPTURE_ENABLED": true,
+  "REASONING_CACHE_ENABLED": true
+}
+```
+
+**OpenCode integration points**:
+- **Provider**: `@ai-sdk/openai-compatible` with `baseURL: "http://localhost:4096/v1"` — model format `"providerName,modelName"`
+- **MCP**: `"type": "remote", "url": "http://localhost:4096/api/mcp"` — tools: `semantic_search`, `semantic_store`, `health_check`
+- **Plugin**: `.opencode/plugins/ccr-plugin.js` — auto-injects build deps, preserves CCR context during compaction
+- **REST API**: `/api/context/*` endpoints for direct programmatic access
+
+**OpenCode docs researched**:
+- Provider system: 75+ built-in providers via AI SDK + Models.dev, custom providers via `@ai-sdk/openai-compatible`
+- Plugin system: JS/TS modules in `.opencode/plugins/`, hooks: `tool.execute.before/after`, `experimental.session.compacting`, `event`, custom tools via `tool()` helper
+- MCP: local/remote servers, tools auto-available to LLM
+- SDK: `@opencode-ai/sdk` for programmatic access, SSE events, session management
+- Config: merged layering (remote → global → project → inline), env var substitution `{env:VAR}`, file substitution `{file:path}`

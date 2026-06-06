@@ -228,13 +228,13 @@ export class MiddlewareOrchestrator {
         endpoint: this.configService.get("GPTCACHE_ENDPOINT"),
       },
       memoryBridge: {
-        enabled: this.configService.get("MEMORY_BRIDGE_ENABLED") !== false,
+        enabled: this.configService.get("MEMORY_BRIDGE_ENABLED") === true,
         storagePath: this.configService.get("MEMORY_STORAGE_PATH") || "./dev/memories.jsonl",
         extractionEnabled:
-          this.configService.get("MEMORY_EXTRACTION_ENABLED") !== false,
+          this.configService.get("MEMORY_EXTRACTION_ENABLED") === true,
       },
       ragEnricher: {
-        enabled: this.configService.get("RAG_ENRICHER_ENABLED") !== false,
+        enabled: this.configService.get("RAG_ENRICHER_ENABLED") === true,
         projectRoot: this.configService.get("PROJECT_ROOT") || process.cwd(),
         maxEnrichmentTokens:
           this.configService.get("RAG_MAX_ENRICHMENT_TOKENS") || 2000,
@@ -257,7 +257,7 @@ export class MiddlewareOrchestrator {
         vectorStoreCollection: this.configService.get("RAG_VECTOR_STORE_COLLECTION") || "rag_documents",
       },
       contextCapture: {
-        enabled: this.configService.get("CONTEXT_CAPTURE_ENABLED") !== false,
+        enabled: this.configService.get("CONTEXT_CAPTURE_ENABLED") === true,
         storageMode: this.configService.get("CONTEXT_CAPTURE_STORAGE") || "jsonl",
         postgresConnectionString: this.configService.get("PG_CONNECTION_STRING"),
         jsonlPath: this.configService.get("CONTEXT_CAPTURE_JSONL_PATH") || "./dev/captures.jsonl",
@@ -794,22 +794,21 @@ export class MiddlewareOrchestrator {
       const tokenCount = (req as any).tokenCount || 0;
       const scenarioType = (req as any).scenarioType || '';
 
-      // Gate RAG injection: skip trivial/simple flash queries only
-      // Always inject for: pro models, thinking/reasoning, named agents, or large context
       const modelId = Array.isArray((req as any).model) 
         ? (req as any).model.join(',') 
         : ((req as any).model || req.body?.model || '');
       const routeTier = (req as any).routeTier || '';
       const isProModel = modelId.includes('pro') || modelId.includes('opus') || routeTier === 'pro' || routeTier === 'pro_max';
-      const shouldEnrich = tokenCount >= 500 || 
+      const shouldEnrich = this.middlewareConfig.ragEnricher?.enabled && (
+        tokenCount >= 500 || 
         scenarioType === 'think' || 
         scenarioType === 'reasoning_pro_max' ||
         scenarioType === 'reasoning_flash' ||
         isProModel ||
-        (context.agentName && !['_default', 'unknown', 'Explore'].includes(context.agentName));
+        (context.agentName && !['_default', 'unknown', 'Explore'].includes(context.agentName))
+      );
 
       if (shouldEnrich) {
-        // Enrich system prompt with RAG context (100ms budget)
         const enrichmentResult = await withTimeout(
           this.ragEnricher.enrich(req.body.system, context),
           100,
@@ -824,32 +823,31 @@ export class MiddlewareOrchestrator {
         }
       }
 
-      // Retrieve and inject memory context (100ms budget)
-      const memories = await withTimeout(
-        this.memoryBridge.retrieve(context),
-        100,
-        [],
-        "memoryBridge.retrieve",
-        this.logger
-      );
-      if (memories.length > 0) {
-        // Append memory hints to system prompt
-        const memoryHint = [
-          "\n<memory_hints>",
-          ...memories.map((m: any, i: number) => `[${i + 1}] ${m.content || m.memory}`),
-          "</memory_hints>",
-        ].join("\n");
+      if (this.middlewareConfig.memoryBridge?.enabled) {
+        const memories = await withTimeout(
+          this.memoryBridge.retrieve(context),
+          100,
+          [],
+          "memoryBridge.retrieve",
+          this.logger
+        );
+        if (memories.length > 0) {
+          const memoryHint = [
+            "\n<memory_hints>",
+            ...memories.map((m: any, i: number) => `[${i + 1}] ${m.content || m.memory}`),
+            "</memory_hints>",
+          ].join("\n");
 
-        if (typeof req.body.system === "string") {
-          req.body.system += memoryHint;
-        } else if (Array.isArray(req.body.system)) {
-          req.body.system.push({ type: "text", text: memoryHint });
+          if (typeof req.body.system === "string") {
+            req.body.system += memoryHint;
+          } else if (Array.isArray(req.body.system)) {
+            req.body.system.push({ type: "text", text: memoryHint });
+          }
+          (req as any)._memoryEnriched = true;
         }
-        (req as any)._memoryEnriched = true;
       }
 
-      // Retrieve reasoning hints for think/reasoning scenarios
-      if (scenarioType === 'think' || scenarioType === 'reasoning_pro_max' || isProModel) {
+      if (this.middlewareConfig.reasoningCache?.enabled && (scenarioType === 'think' || scenarioType === 'reasoning_pro_max' || isProModel)) {
         const query = this.extractQuerySummary(req.body);
         const chains = await withTimeout(
           this.reasoningCache.retrieve(query),
@@ -869,13 +867,11 @@ export class MiddlewareOrchestrator {
         }
       }
 
-      // Execute onRouteDecision hooks
       const hookCtx = this.hookManager.createContext(req);
       hookCtx.tokenCount = (req as any).tokenCount;
       hookCtx.scenarioType = (req as any).scenarioType;
       await this.hookManager.execute("onRouteDecision", hookCtx);
 
-      // Apply prompt template injection (if configured)
       try {
         const promptEngine = getPromptTemplateEngine();
         if (promptEngine) {
@@ -897,38 +893,8 @@ export class MiddlewareOrchestrator {
         this.logger.debug(`PromptTemplate failed: ${e?.message}`);
       }
 
-      // Apply compliance disclaimer for financial queries
-      try {
-        const disclaimer = getComplianceDisclaimer();
-        if (disclaimer) {
-          const result = disclaimer.process(req.body);
-          if (result.modified) {
-            req.body = result.body;
-            (req as any)._complianceDisclaimer = true;
-          }
-        }
-      } catch (e: any) {
-        this.logger.debug(`ComplianceDisclaimer failed: ${e?.message}`);
-      }
-
       if (this.promptCaching['config']?.enabled !== false) {
         req.body = this.promptCaching.injectCacheControl(req.body);
-      }
-
-      if (this.financialPIIMasker.getStats().enabled) {
-        const maskResult = this.financialPIIMasker.maskBody(req.body);
-        if (maskResult.maskMap.size > 0) {
-          req.body = maskResult.body;
-          (req as any)._piiMasked = maskResult.maskMap.size;
-        }
-      }
-
-      if (this.abTesting.getStats().enabled) {
-        const sessionId = context.sessionId || "default";
-        const abVariant = this.abTesting.assignVariant(sessionId, "default");
-        if (abVariant) {
-          (req as any)._abVariant = abVariant;
-        }
       }
 
       if (this.summaryInjector['config']?.enabled && this.summaryInjector.shouldCompact(req.body)) {
@@ -940,50 +906,50 @@ export class MiddlewareOrchestrator {
         }
       }
 
-      // SessionBridge: process request for compaction detection and context preservation
-      try {
-        const sessionResult = this.sessionBridge.processRequest(
-          context.sessionId || "unknown",
-          req.body
-        );
-        if (sessionResult.isCompaction) {
-          (req as any)._compactionDetected = true;
-          this.logger?.info(`SessionBridge: compaction detected for ${context.sessionId}`);
-        }
-        if (sessionResult.preservedContextToInject.length > 0) {
-          const preservedHint = [
-            "\n<preserved_context>",
-            ...sessionResult.preservedContextToInject.map(c => `[${c.source}] ${c.value}`),
-            "</preserved_context>",
-          ].join("\n");
-          if (typeof req.body.system === "string") {
-            req.body.system += preservedHint;
-          } else if (Array.isArray(req.body.system)) {
-            req.body.system.push({ type: "text", text: preservedHint });
+      if (this.middlewareConfig.contextCapture?.enabled) {
+        try {
+          const sessionResult = this.sessionBridge.processRequest(
+            context.sessionId || "unknown",
+            req.body
+          );
+          if (sessionResult.isCompaction) {
+            (req as any)._compactionDetected = true;
+            this.logger?.info(`SessionBridge: compaction detected for ${context.sessionId}`);
           }
-          (req as any)._contextPreserved = true;
-        }
-      } catch (e: any) {
-        this.logger.debug(`SessionBridge request processing failed: ${e?.message}`);
-      }
-
-      // EvolutionBridge: detect skills and inject evolution context
-      try {
-        const skills = this.evolutionBridge.detectSkills(req.body);
-        if (skills.length > 0) {
-          (req as any)._detectedSkills = skills;
-
-          const evolutionContext = this.evolutionBridge.buildContextInjection(skills);
-          if (evolutionContext && typeof req.body.system === "string") {
-            req.body.system += "\n" + evolutionContext;
-            (req as any)._evolutionEnriched = true;
-          } else if (evolutionContext && Array.isArray(req.body.system)) {
-            req.body.system.push({ type: "text", text: evolutionContext });
-            (req as any)._evolutionEnriched = true;
+          if (sessionResult.preservedContextToInject.length > 0) {
+            const preservedHint = [
+              "\n<preserved_context>",
+              ...sessionResult.preservedContextToInject.map(c => `[${c.source}] ${c.value}`),
+              "</preserved_context>",
+            ].join("\n");
+            if (typeof req.body.system === "string") {
+              req.body.system += preservedHint;
+            } else if (Array.isArray(req.body.system)) {
+              req.body.system.push({ type: "text", text: preservedHint });
+            }
+            (req as any)._contextPreserved = true;
           }
+        } catch (e: any) {
+          this.logger.debug(`SessionBridge request processing failed: ${e?.message}`);
         }
-      } catch (e: any) {
-        this.logger.debug(`EvolutionBridge skill detection failed: ${e?.message}`);
+
+        try {
+          const skills = this.evolutionBridge.detectSkills(req.body);
+          if (skills.length > 0) {
+            (req as any)._detectedSkills = skills;
+
+            const evolutionContext = this.evolutionBridge.buildContextInjection(skills);
+            if (evolutionContext && typeof req.body.system === "string") {
+              req.body.system += "\n" + evolutionContext;
+              (req as any)._evolutionEnriched = true;
+            } else if (evolutionContext && Array.isArray(req.body.system)) {
+              req.body.system.push({ type: "text", text: evolutionContext });
+              (req as any)._evolutionEnriched = true;
+            }
+          }
+        } catch (e: any) {
+          this.logger.debug(`EvolutionBridge skill detection failed: ${e?.message}`);
+        }
       }
 
     } catch (error: any) {
@@ -1064,14 +1030,15 @@ export class MiddlewareOrchestrator {
         }
       }
 
-      // Extract memories from conversation (fire-and-forget, don't await)
-      this.memoryBridge.extractFromConversation(
-        req.body,
-        responseBody,
-        context
-      ).catch((err: any) => {
-        this.logger?.debug(`Memory extraction failed: ${err?.message}`);
-      });
+      if (this.middlewareConfig.memoryBridge?.enabled) {
+        this.memoryBridge.extractFromConversation(
+          req.body,
+          responseBody,
+          context
+        ).catch((err: any) => {
+          this.logger?.debug(`Memory extraction failed: ${err?.message}`);
+        });
+      }
 
       // Capture full context for HSE/SkillClaw (fire-and-forget)
       const usage = responseBody?.usage || {};
@@ -1104,25 +1071,27 @@ export class MiddlewareOrchestrator {
         redactedResponse = redactObject(responseBody);
       } catch (e: any) { this.logger.debug(`onPostResponse redact failed: ${e?.message}`); }
 
-      this.contextCapture.capture({
-        sessionId: context.sessionId,
-        agentType: (req as any).gatewayAgentName || detectAgentFromReq(req),
-        modelTier: (req as any).routeTier || 'unknown',
-        provider: (req as any).provider || 'unknown',
-        modelId: (req as any).model || 'unknown',
-        tokenCount: (req as any).tokenCount,
-        requestBody: redactedBody,
-        responseBody: redactedResponse,
-        usage,
-        startTime: (req as any)._startTime,
-        endTime: Date.now(),
-        scenarioType: (req as any).scenarioType || 'unknown',
-        hallucinationRisk: reasoningCtx.hallucinationRisk,
-        cacheHit: !!(req as any)._cacheHit,
-        ragEnriched: !!(req as any)._ragEnriched,
-      }).catch((err) => {
-        this.logger?.warn(`Context capture failed: ${err?.message}`);
-      });
+      if (this.middlewareConfig.contextCapture?.enabled) {
+        this.contextCapture.capture({
+          sessionId: context.sessionId,
+          agentType: (req as any).gatewayAgentName || detectAgentFromReq(req),
+          modelTier: (req as any).routeTier || 'unknown',
+          provider: (req as any).provider || 'unknown',
+          modelId: (req as any).model || 'unknown',
+          tokenCount: (req as any).tokenCount,
+          requestBody: redactedBody,
+          responseBody: redactedResponse,
+          usage,
+          startTime: (req as any)._startTime,
+          endTime: Date.now(),
+          scenarioType: (req as any).scenarioType || 'unknown',
+          hallucinationRisk: reasoningCtx.hallucinationRisk,
+          cacheHit: !!(req as any)._cacheHit,
+          ragEnriched: !!(req as any)._ragEnriched,
+        }).catch((err) => {
+          this.logger?.warn(`Context capture failed: ${err?.message}`);
+        });
+      }
 
       // WebSocket push for high hallucination risk
       if (reasoningCtx.hallucinationRisk > 0.5) {

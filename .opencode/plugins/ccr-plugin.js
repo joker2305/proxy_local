@@ -1,4 +1,4 @@
-export const CcrPlugin = async ({ project, directory, worktree }) => {
+export const CcrPlugin = async ({ project, client, directory, worktree }) => {
   return {
     "tool.execute.before": async (input, output) => {
       if (input.tool === "bash" && output.args) {
@@ -33,12 +33,36 @@ export const CcrPlugin = async ({ project, directory, worktree }) => {
         `## CCR Proxy Architecture (preserve across compaction)
 - Monorepo: shared → core(@musistudio/llms) → server → cli, plus ui (ESM)
 - Build: esbuild (core/server/cli/shared), Vite (ui). Always build shared before core.
-- Framework: Fastify. Transformer pipeline: Anthropic → Unified(OpenAI) → Provider-native.
-- Key files: routes.ts (2414L), router.ts (654L), anthropic.transformer.ts, server.ts
+- Framework: Fastify. Transformer pipeline: Anthropic ↔ Unified(OpenAI) ↔ Provider-native.
+- Key files: routes.ts, router.ts, anthropic.transformer.ts, server.ts
 - Config: ~/.claude-code-router/config.json (JSON5). Model format: "providerName,modelName"
 - Tests: vitest. Run: pnpm test or npx vitest run <path>
-- See AGENTS.md for full reference including protocol gaps and ecosystem patterns.`
+- Architecture: CCR is a proxy service for OpenCode. Routing/context injection via plugins/MCP.
+- See AGENTS.md for full reference.`
       );
+
+      try {
+        const resp = await fetch("http://localhost:4096/api/semantic/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            query: input.session?.title || "project context",
+            scope: "project",
+            limit: 3,
+            threshold: 0.5,
+          }),
+          signal: AbortSignal.timeout(2000),
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          if (data.results?.length > 0) {
+            const ctx = data.results
+              .map((r, i) => `[${i + 1}] (${r.source || "semantic"}) ${(r.content || "").substring(0, 500)}`)
+              .join("\n");
+            output.context.push(`## CCR Semantic Context\n${ctx}`);
+          }
+        }
+      } catch {}
     },
   };
 };

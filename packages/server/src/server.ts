@@ -155,16 +155,22 @@ export const createServer = async (config: any): Promise<any> => {
     }
   });
 
-  // Register static file serving with caching
   app.register(fastifyStatic, {
     root: join(__dirname, "..", "dist"),
     prefix: "/ui/",
-    maxAge: "1h",
+    maxAge: 0,
   });
 
-  // Redirect /ui to /ui/ for proper static file serving
   app.get("/ui", async (_: any, reply: any) => {
     return reply.redirect("/ui/");
+  });
+
+  app.setNotFoundHandler(async (req: any, reply: any) => {
+    if (req.url?.startsWith("/ui/") && !req.url.includes(".")) {
+      reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+      return reply.type("text/html").sendFile("index.html");
+    }
+    reply.code(404).send({ error: "Not Found" });
   });
 
   // Get log file list endpoint
@@ -846,6 +852,207 @@ export const createServer = async (config: any): Promise<any> => {
       return { models: allModels, defaultContextWindow: DEFAULT_MODEL_LIMITS.contextWindow };
     } catch (e: any) {
       return { models: {}, error: e.message };
+    }
+  });
+
+  // --- Context Service API (for OpenCode plugins/MCP) ---
+  app.post("/api/context/store", async (req: any, reply: any) => {
+    try {
+      const { scope, topic, content, metadata } = req.body;
+      if (!scope || !topic || !content) {
+        return reply.status(400).send({ error: "scope, topic, and content are required" });
+      }
+      const result = await semanticStore.upsert({
+        scope: scope || "session",
+        topic,
+        content,
+        metadata,
+        depth: req.body.depth,
+        trust: req.body.trust,
+        source: req.body.source || "opencode",
+      });
+      if (!result) {
+        return reply.status(503).send({ error: "Semantic store unavailable" });
+      }
+      return { success: true, id: result.id };
+    } catch (error: any) {
+      return reply.status(500).send({ error: error.message || "Failed to store context" });
+    }
+  });
+
+  app.post("/api/context/query", async (req: any, reply: any) => {
+    try {
+      const { query, scope, topic, limit, threshold } = req.body;
+      if (!query) {
+        return reply.status(400).send({ error: "query is required" });
+      }
+      const results = await semanticStore.search(query, {
+        scope,
+        topic,
+        limit: limit || 5,
+        threshold: threshold || 0.5,
+      });
+      return { results };
+    } catch (error: any) {
+      return reply.status(500).send({ error: error.message || "Failed to query context" });
+    }
+  });
+
+  app.get("/api/context/stats", async (req: any, reply: any) => {
+    try {
+      const health = await semanticStore.healthCheck();
+      return {
+        semanticStore: health,
+        timestamp: new Date().toISOString(),
+      };
+    } catch (error: any) {
+      return { semanticStore: { connected: false, error: error.message } };
+    }
+  });
+
+  app.post("/api/context/collect", async (req: any, reply: any) => {
+    try {
+      return { success: true, message: "Context collection is automatic via proxy pipeline" };
+    } catch (error: any) {
+      return reply.status(500).send({ error: error.message });
+    }
+  });
+
+  // --- MCP-compatible endpoint for OpenCode ---
+  app.post("/api/mcp", async (req: any, reply: any) => {
+    try {
+      const { jsonrpc, method, params, id } = req.body || {};
+
+      if (jsonrpc !== "2.0") {
+        return { jsonrpc: "2.0", error: { code: -32600, message: "Invalid Request" }, id: id || null };
+      }
+
+      if (method === "initialize") {
+        return {
+          jsonrpc: "2.0",
+          result: {
+            protocolVersion: "2024-11-05",
+            capabilities: { tools: {} },
+            serverInfo: { name: "ccr-context-service", version: "2.0.0" },
+          },
+          id,
+        };
+      }
+
+      if (method === "tools/list") {
+        return {
+          jsonrpc: "2.0",
+          result: {
+            tools: [
+              {
+                name: "semantic_search",
+                description: "Search the CCR semantic store for relevant context about the project",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    query: { type: "string", description: "Search query" },
+                    scope: { type: "string", enum: ["session", "project", "reference"], description: "Search scope" },
+                    limit: { type: "number", description: "Max results (default 5)" },
+                  },
+                  required: ["query"],
+                },
+              },
+              {
+                name: "semantic_store",
+                description: "Store context information in the CCR semantic store for future retrieval",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    scope: { type: "string", enum: ["session", "project", "reference"] },
+                    topic: { type: "string", description: "Topic/category" },
+                    content: { type: "string", description: "Content to store" },
+                  },
+                  required: ["scope", "topic", "content"],
+                },
+              },
+              {
+                name: "health_check",
+                description: "Check CCR proxy health status",
+                inputSchema: { type: "object", properties: {} },
+              },
+            ],
+          },
+          id,
+        };
+      }
+
+      if (method === "tools/call") {
+        const toolName = params?.name;
+        const args = params?.arguments || {};
+
+        if (toolName === "semantic_search") {
+          const results = await semanticStore.search(args.query || "", {
+            scope: args.scope,
+            limit: args.limit || 5,
+          });
+          return {
+            jsonrpc: "2.0",
+            result: {
+              content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+            },
+            id,
+          };
+        }
+
+        if (toolName === "semantic_store") {
+          const result = await semanticStore.upsert({
+            scope: args.scope || "session",
+            topic: args.topic || "general",
+            content: args.content || "",
+            source: "opencode-mcp",
+          });
+          return {
+            jsonrpc: "2.0",
+            result: {
+              content: [{ type: "text", text: result ? `Stored: ${result.id}` : "Store unavailable" }],
+            },
+            id,
+          };
+        }
+
+        if (toolName === "health_check") {
+          const health = await semanticStore.healthCheck();
+          const srv = getServer(app);
+          const providers = srv?.providerService.getProviders() || [];
+          return {
+            jsonrpc: "2.0",
+            result: {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  status: "ok",
+                  providers: providers.map((p: any) => p.name),
+                  semanticStore: health,
+                }),
+              }],
+            },
+            id,
+          };
+        }
+
+        return {
+          jsonrpc: "2.0",
+          error: { code: -32601, message: `Unknown tool: ${toolName}` },
+          id,
+        };
+      }
+
+      return {
+        jsonrpc: "2.0",
+        error: { code: -32601, message: `Unknown method: ${method}` },
+        id: id || null,
+      };
+    } catch (error: any) {
+      return {
+        jsonrpc: "2.0",
+        error: { code: -32603, message: error.message },
+        id: (req.body || {}).id || null,
+      };
     }
   });
 
