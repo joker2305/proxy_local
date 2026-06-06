@@ -176,7 +176,9 @@ Created full OpenCode toolchain based on:
 | Plugin | Purpose |
 |--------|---------|
 | `ccr-plugin.js` | Build dependency auto-injection; session compaction context preservation with CCR semantic store query |
-| `ccr-context-plugin.js` | Full CCR context service integration: health check on init, semantic context injection during compaction, build dependency injection, session idle event handling |
+| `ccr-context-plugin.js` | CCR context service integration: health check on init, semantic context injection during compaction, build dependency injection, session idle event handling |
+| `ccr-routing-plugin.js` | CCR routing awareness: discovers available providers/models from CCR, injects model info during compaction, tracks session lifecycle |
+| `ccr-tools-plugin.js` | Custom OpenCode tools (`ccr_search`, `ccr_store`) for direct LLM access to CCR semantic store |
 
 ### Configuration
 
@@ -247,3 +249,18 @@ Completed the toolchain with operational tooling:
 - MCP: local/remote servers, tools auto-available to LLM
 - SDK: `@opencode-ai/sdk` for programmatic access, SSE events, session management
 - Config: merged layering (remote → global → project → inline), env var substitution `{env:VAR}`, file substitution `{file:path}`
+
+### Round 5 Context — OpenCode Integration Plugins & MCP Tools (commit 528d515+)
+
+Created full set of OpenCode plugins that replace CCR's transparent injection with explicit, user-controlled tools:
+- **ccr-plugin.js**: Simplified — build deps + compaction context with CCR semantic query
+- **ccr-context-plugin.js**: Health check on init, semantic context injection during compaction, session idle handling
+- **ccr-routing-plugin.js**: Discovers available providers/models from CCR, injects model info during compaction, tracks session lifecycle
+- **ccr-tools-plugin.js**: Custom OpenCode tools (`ccr_search`, `ccr_store`) for direct LLM access to CCR semantic store
+
+MCP endpoint (`/api/mcp`) enhanced:
+- Added `notifications/initialized` and `ping` method support
+- Added `cache_status` tool for monitoring semantic store
+- Full JSON-RPC 2.0 compliance with proper error codes
+
+This completes the transition from "CCR as black-box gateway" to "CCR as transparent proxy + opt-in context service for OpenCode".

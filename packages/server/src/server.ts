@@ -927,6 +927,14 @@ export const createServer = async (config: any): Promise<any> => {
         return { jsonrpc: "2.0", error: { code: -32600, message: "Invalid Request" }, id: id || null };
       }
 
+      if (method === "notifications/initialized" || method === "initialized") {
+        return { jsonrpc: "2.0", result: {}, id };
+      }
+
+      if (method === "ping") {
+        return { jsonrpc: "2.0", result: {}, id };
+      }
+
       if (method === "initialize") {
         return {
           jsonrpc: "2.0",
@@ -973,6 +981,11 @@ export const createServer = async (config: any): Promise<any> => {
               {
                 name: "health_check",
                 description: "Check CCR proxy health status",
+                inputSchema: { type: "object", properties: {} },
+              },
+              {
+                name: "cache_status",
+                description: "Get CCR semantic cache status and hit/miss statistics",
                 inputSchema: { type: "object", properties: {} },
               },
             ],
@@ -1028,6 +1041,23 @@ export const createServer = async (config: any): Promise<any> => {
                   status: "ok",
                   providers: providers.map((p: any) => p.name),
                   semanticStore: health,
+                }),
+              }],
+            },
+            id,
+          };
+        }
+
+        if (toolName === "cache_status") {
+          const health = await semanticStore.healthCheck();
+          return {
+            jsonrpc: "2.0",
+            result: {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  semanticStore: health,
+                  timestamp: new Date().toISOString(),
                 }),
               }],
             },
