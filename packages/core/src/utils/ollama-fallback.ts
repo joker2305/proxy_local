@@ -16,7 +16,9 @@ export interface OllamaFallbackConfig {
   ollamaProvider: string;
   /** Local model to use for fallback */
   fallbackModel: string;
-  /** Proxy port for self-calls */
+  /** Direct Ollama API endpoint (bypasses proxy self-call) */
+  ollamaEndpoint: string;
+  /** Proxy port (kept for backward compat, prefer ollamaEndpoint) */
   proxyPort: number;
   /** API key for self-calls */
   apiKey: string;
@@ -31,7 +33,8 @@ export interface OllamaFallbackConfig {
 const DEFAULT_CONFIG: OllamaFallbackConfig = {
   enabled: false,
   ollamaProvider: 'ollama',
-  fallbackModel: 'ollama,qwen2.5-coder:7b',
+  fallbackModel: 'qwen2.5-coder:7b',
+  ollamaEndpoint: 'http://127.0.0.1:11434',
   proxyPort: 3456,
   apiKey: '',
   timeoutThresholdMs: 30000,
@@ -65,22 +68,29 @@ export class OllamaFallback {
     }
 
     const startTime = Date.now();
-    this.logger?.warn(`OllamaFallback: triggered (${reason}), using ${this.config.fallbackModel}`);
+    const model = this.config.fallbackModel;
+    this.logger?.warn(`OllamaFallback: triggered (${reason}), using ${model}`);
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.ollamaTimeoutMs);
 
     try {
-      const response = await fetch(`http://127.0.0.1:${this.config.proxyPort}/v1/messages`, {
+      const messages = (body?.messages || []).map((m: any) => ({
+        role: m.role,
+        content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+      }));
+
+      const response = await fetch(`${this.config.ollamaEndpoint}/api/chat`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': this.config.apiKey,
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          ...body,
-          model: this.config.fallbackModel,
+          model,
+          messages,
           stream: false,
+          options: {
+            temperature: body?.temperature,
+            top_p: body?.top_p,
+          },
         }),
         signal: controller.signal,
       });
@@ -88,23 +98,38 @@ export class OllamaFallback {
 
       if (!response.ok) {
         this.logger?.warn(`OllamaFallback: Ollama returned ${response.status}`);
-        return { used: true, response: null, model: this.config.fallbackModel, latencyMs: Date.now() - startTime, reason };
+        return { used: true, response: null, model, latencyMs: Date.now() - startTime, reason };
       }
 
       const data = await response.json();
+
+      const anthropicResponse = {
+        id: `ollama-${Date.now()}`,
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: data.message?.content || '' }],
+        model,
+        stop_reason: data.done_reason || 'end_turn',
+        stop_sequence: null,
+        usage: {
+          input_tokens: data.prompt_eval_count || 0,
+          output_tokens: data.eval_count || 0,
+        },
+      };
+
       this.logger?.info(`OllamaFallback: succeeded in ${Date.now() - startTime}ms`);
 
       return {
         used: true,
-        response: data,
-        model: this.config.fallbackModel,
+        response: anthropicResponse,
+        model,
         latencyMs: Date.now() - startTime,
         reason,
       };
     } catch (e: any) {
       clearTimeout(timeout);
       this.logger?.warn(`OllamaFallback: failed (${e?.message})`);
-      return { used: true, response: null, model: this.config.fallbackModel, latencyMs: Date.now() - startTime, reason };
+      return { used: true, response: null, model, latencyMs: Date.now() - startTime, reason };
     }
   }
 
@@ -113,9 +138,6 @@ export class OllamaFallback {
    */
   isEligible(body: any): boolean {
     if (!this.config.enabled) return false;
-    // Don't fallback for streaming requests
-    if (body?.stream) return false;
-    // Don't fallback if already using Ollama
     if (body?.model?.includes('ollama')) return false;
     return true;
   }
