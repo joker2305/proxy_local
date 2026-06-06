@@ -117,3 +117,39 @@ Claw Code (`D:\project\claw-code-main`) is a Rust reimplementation of Claude Cod
 | LiteLLM (20k+ stars) | Streaming chunk reassembly for accurate usage; thinking block reconstruction with signatures |
 | Portkey Gateway (12k+ stars) | Configurable fallback/loadbalance routing; per-target retry/timeout; `x-api-key` header forwarding |
 | OneAPI (22k+ stars) | Channel health monitoring with auto-disable; per-model billing ratios; model name rewriting |
+
+## OpenCode Toolchain (`.opencode/`)
+
+### Skills (loaded on-demand via `skill` tool)
+
+| Skill | Purpose |
+|-------|---------|
+| `protocol-analysis` | Anthropic API protocol details, SSE event types, known compatibility gaps |
+| `transformer-dev` | Transformer interface, pipeline order, passthrough mode, all existing transformers |
+| `proxy-debug` | Request flow trace map, common failure patterns, debugging approaches |
+| `claw-code-compare` | Claw-code file map, priority comparison points, original Claude Code intelligence |
+
+### Custom Agents (invoked via `@agent-name` or Task tool)
+
+| Agent | Mode | Purpose |
+|-------|------|---------|
+| `protocol-compare` | subagent (read-only) | Gap analysis between claw-code and CCR for a specific feature |
+| `os-research` | subagent (read-only) | Research open-source LLM gateways for improvement patterns |
+| `pipeline-tracer` | subagent (read-only) | Trace full transformer pipeline for a specific provider/scenario |
+
+### Custom Commands
+
+| Command | Purpose |
+|---------|---------|
+| `/test` | Run vitest tests (all or specific file) |
+| `/build` | Build packages (respects ordering) |
+| `/dev` | Start dev server with hot reload |
+| `/analyze-gap <topic>` | Analyze a specific protocol gap against claw-code reference |
+
+### Round 1 Context (commit 2e1712b)
+
+Created full OpenCode toolchain based on:
+- Deep analysis of claw-code Rust implementation (anthropic.rs, openai_compat.rs, sse.rs, mod.rs)
+- OpenCode official docs (skills, agents, commands, plugins formats)
+- Comparison of CCR's transformer pipeline against Anthropic spec and claw-code patterns
+- Research of LiteLLM, Portkey, OneAPI for architectural reference
