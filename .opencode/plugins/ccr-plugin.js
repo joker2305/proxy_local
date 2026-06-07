@@ -16,9 +16,7 @@ export const CcrPlugin = async ({ project, client, directory, worktree }) => {
             .filter((c) => !fs.existsSync(path.join(root, c.dir)))
             .map((c) => c.pkg);
           if (missing.length > 0) {
-            const prefix = missing
-              .map((m) => `pnpm build:${m}`)
-              .join(" && ");
+            const prefix = missing.map((m) => `pnpm build:${m}`).join(" && ");
             output.args.command =
               typeof output.args === "string"
                 ? `${prefix} && ${cmd}`
@@ -37,32 +35,9 @@ export const CcrPlugin = async ({ project, client, directory, worktree }) => {
 - Key files: routes.ts, router.ts, anthropic.transformer.ts, server.ts
 - Config: ~/.claude-code-router/config.json (JSON5). Model format: "providerName,modelName"
 - Tests: vitest. Run: pnpm test or npx vitest run <path>
-- Architecture: CCR is a proxy service for OpenCode. Routing/context injection via plugins/MCP.
-- See AGENTS.md for full reference.`
+- Architecture: CCR is a transparent proxy + opt-in context service for OpenCode.
+- See AGENTS.md for full reference including protocol gaps and ecosystem patterns.`
       );
-
-      try {
-        const resp = await fetch("http://localhost:4096/api/semantic/search", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            query: input.session?.title || "project context",
-            scope: "project",
-            limit: 3,
-            threshold: 0.5,
-          }),
-          signal: AbortSignal.timeout(2000),
-        });
-        if (resp.ok) {
-          const data = await resp.json();
-          if (data.results?.length > 0) {
-            const ctx = data.results
-              .map((r, i) => `[${i + 1}] (${r.source || "semantic"}) ${(r.content || "").substring(0, 500)}`)
-              .join("\n");
-            output.context.push(`## CCR Semantic Context\n${ctx}`);
-          }
-        }
-      } catch {}
     },
   };
 };

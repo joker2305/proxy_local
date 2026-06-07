@@ -165,6 +165,27 @@ Claw Code (`D:\project\claw-code-main`) is a Rust reimplementation of Claude Cod
 | `/dev` | Start dev server with hot reload |
 | `/analyze-gap <topic>` | Analyze a specific protocol gap against claw-code reference |
 
+### Custom Plugins (`.opencode/plugins/`)
+
+| Plugin | Purpose |
+|--------|---------|
+| `ccr-plugin.js` | Build dependency auto-injection + compaction context preservation |
+| `ccr-context-plugin.js` | CCR health check on init, semantic context during compaction, session idle event |
+| `ccr-routing-plugin.js` | Discovers providers/models from CCR, injects model info during compaction |
+
+### Custom Tools (`.opencode/tools/`)
+
+| Tool | Purpose |
+|------|---------|
+| `ccr_search.js` | Search CCR semantic store for project context |
+| `ccr_store.js` | Store context in CCR semantic store for future retrieval |
+
+### Configuration
+
+- **`opencode.example.jsonc`** — Template for project-level OpenCode config (copy to `opencode.jsonc`, fill in models/provider keys)
+- **`opencode.json`/`opencode.jsonc`** are gitignored (contain API keys)
+- **`examples/opencode-provider-config.json`** — Minimal provider-only config example
+
 ### Round 1 Context (commit 2e1712b)
 
 Created full OpenCode toolchain based on:
@@ -172,27 +193,6 @@ Created full OpenCode toolchain based on:
 - OpenCode official docs (skills, agents, commands, plugins formats)
 - Comparison of CCR's transformer pipeline against Anthropic spec and claw-code patterns
 - Research of LiteLLM, Portkey, OneAPI for architectural reference
-
-### Custom Plugin (`.opencode/plugins/`)
-
-| Plugin | Purpose |
-|--------|---------|
-| `ccr-plugin.js` | Build dependency auto-injection; session compaction context preservation with CCR semantic store query |
-| `ccr-context-plugin.js` | CCR context service integration: health check on init, semantic context injection during compaction, build dependency injection, session idle event handling |
-| `ccr-routing-plugin.js` | CCR routing awareness: discovers available providers/models from CCR, injects model info during compaction, tracks session lifecycle |
-| `ccr-tools-plugin.js` | Custom OpenCode tools (`ccr_search`, `ccr_store`) for direct LLM access to CCR semantic store |
-
-### Custom Tools (`.opencode/tools/`)
-
-| Tool | Purpose |
-|------|---------|
-| `ccr_search.js` | Search CCR semantic store for project context (standalone tool, not plugin-dependent) |
-| `ccr_store.js` | Store context in CCR semantic store for future retrieval (standalone tool) |
-
-### Configuration
-
-- **`opencode.example.jsonc`** — Template for project-level OpenCode config (copy to `opencode.jsonc`, fill in models/provider keys)
-- **`opencode.json`/`opencode.jsonc`** are gitignored (contain API keys)
 
 ### Round 2 Context (commit fdf5fdd)
 
@@ -203,12 +203,14 @@ Expanded analysis to broader AI agent ecosystem:
 - **Cursor**: Closed-source but model switching per task, worktrees for parallel agents, rules system
 - Key cross-cutting patterns: `provider/model` model ID convention (all tools), prompt-based editing vs function calling (Aider avoids function calling), per-model streaming/capability flags
 
-### Round 3 Context (commit pending)
+### Round 3 Context (commit b99ee18)
 
-Completed the toolchain with operational tooling:
-- **ccr-plugin.js**: `tool.execute.before` hook auto-injects `pnpm build:shared && pnpm build:core` when missing before `pnpm build`; `experimental.session.compacting` hook preserves CCR architecture context across compaction
-- **opencode.example.jsonc**: Full project config template with build/plan agents, CCR provider config, bash permission rules, skill/task permissions, watcher ignore patterns
-- All 5 skills, 4 agents, 4 commands, 1 plugin, 1 config template now complete
+Completed operational tooling:
+- **ccr-plugin.js**: Build dependency auto-injection + compaction context preservation
+- **ccr-context-plugin.js**: CCR health check on init, semantic context during compaction, session idle event
+- **ccr-routing-plugin.js**: Discovers providers/models from CCR, injects model info during compaction
+- **ccr_search.js / ccr_store.js**: Standalone custom tools for CCR semantic store access
+- **opencode.example.jsonc**: Full project config template with build/plan agents, CCR provider + MCP config
 
 ### Round 4 Context — Architecture Evolution: CCR Serves OpenCode
 
@@ -218,75 +220,18 @@ Completed the toolchain with operational tooling:
 1. **Transparent proxy core** (always on): Transformer pipeline, semantic cache, concurrency, circuit breaker, rate limiting, tool compression, prompt caching
 2. **Opt-in context services** (disabled by default, enabled via config): RAG enricher, memory bridge, context capture, reasoning cache, session bridge, evolution bridge
 
-**Changes in this round**:
-
-| File | Change |
-|------|--------|
-| `packages/core/src/middleware/orchestrator.ts` | RAG enricher, memory bridge, context capture, reasoning cache now default OFF (`=== true` instead of `!== false`). `onPostRoute` and `onPostResponse` check `middlewareConfig.*.enabled` before running |
-| `packages/server/src/server.ts` | Added `/api/context/store`, `/api/context/query`, `/api/context/stats`, `/api/context/collect` REST endpoints. Added `/api/mcp` MCP-compatible JSON-RPC endpoint with `semantic_search`, `semantic_store`, `health_check` tools |
-| `.opencode/plugins/ccr-plugin.js` | Updated: added CCR semantic store query during compaction |
-| `.opencode/plugins/ccr-context-plugin.js` | New: full CCR context integration plugin — health check on init, semantic context injection, session idle handling |
-| `examples/opencode-provider-config.json` | New: example OpenCode config showing CCR as `@ai-sdk/openai-compatible` provider + MCP server |
-| `AGENTS.md` | Added architecture philosophy section, updated plugin docs |
-
 **Config keys changed (from default-on to default-off)**:
-- `RAG_ENRICHER_ENABLED`: was `!== false` → now `=== true`
-- `MEMORY_BRIDGE_ENABLED`: was `!== false` → now `=== true`
-- `MEMORY_EXTRACTION_ENABLED`: was `!== false` → now `=== true`
-- `CONTEXT_CAPTURE_ENABLED`: was `!== false` → now `=== true`
-- `REASONING_CACHE_ENABLED`: unchanged (was already `=== true`)
+- `RAG_ENRICHER_ENABLED`: `!== false` → `=== true`
+- `MEMORY_BRIDGE_ENABLED`: `!== false` → `=== true`
+- `MEMORY_EXTRACTION_ENABLED`: `!== false` → `=== true`
+- `CONTEXT_CAPTURE_ENABLED`: `!== false` → `=== true`
 
-**To re-enable transparent injection**, add to `~/.claude-code-router/config.json`:
+**To re-enable**, add to `~/.claude-code-router/config.json`:
 ```json
-{
-  "RAG_ENRICHER_ENABLED": true,
-  "MEMORY_BRIDGE_ENABLED": true,
-  "CONTEXT_CAPTURE_ENABLED": true,
-  "REASONING_CACHE_ENABLED": true
-}
+{ "RAG_ENRICHER_ENABLED": true, "MEMORY_BRIDGE_ENABLED": true, "CONTEXT_CAPTURE_ENABLED": true, "REASONING_CACHE_ENABLED": true }
 ```
 
 **OpenCode integration points**:
 - **Provider**: `@ai-sdk/openai-compatible` with `baseURL: "http://localhost:4096/v1"` — model format `"providerName,modelName"`
 - **MCP**: `"type": "remote", "url": "http://localhost:4096/api/mcp"` — tools: `semantic_search`, `semantic_store`, `health_check`
-- **Plugin**: `.opencode/plugins/ccr-plugin.js` — auto-injects build deps, preserves CCR context during compaction
 - **REST API**: `/api/context/*` endpoints for direct programmatic access
-
-**OpenCode docs researched**:
-- Provider system: 75+ built-in providers via AI SDK + Models.dev, custom providers via `@ai-sdk/openai-compatible`
-- Plugin system: JS/TS modules in `.opencode/plugins/`, hooks: `tool.execute.before/after`, `experimental.session.compacting`, `event`, custom tools via `tool()` helper
-- MCP: local/remote servers, tools auto-available to LLM
-- SDK: `@opencode-ai/sdk` for programmatic access, SSE events, session management
-- Config: merged layering (remote → global → project → inline), env var substitution `{env:VAR}`, file substitution `{file:path}`
-
-### Round 5 Context — OpenCode Integration Plugins & MCP Tools (commit 528d515+)
-
-Created full set of OpenCode plugins that replace CCR's transparent injection with explicit, user-controlled tools:
-- **ccr-plugin.js**: Simplified — build deps + compaction context with CCR semantic query
-- **ccr-context-plugin.js**: Health check on init, semantic context injection during compaction, session idle handling
-- **ccr-routing-plugin.js**: Discovers available providers/models from CCR, injects model info during compaction, tracks session lifecycle
-- **ccr-tools-plugin.js**: Custom OpenCode tools (`ccr_search`, `ccr_store`) for direct LLM access to CCR semantic store
-
-MCP endpoint (`/api/mcp`) enhanced:
-- Added `notifications/initialized` and `ping` method support
-- Added `cache_status` tool for monitoring semantic store
-- Full JSON-RPC 2.0 compliance with proper error codes
-
-This completes the transition from "CCR as black-box gateway" to "CCR as transparent proxy + opt-in context service for OpenCode".
-
-### Round 6 Context — Config & Protocol Cleanup (commit 02299a4+)
-
-- Updated `opencode.example.jsonc` with MCP server config + example models for DeepSeek/GLM/Gemini/GPT-4o
-- Fixed stale protocol gaps (marked `/v1/models` and `/v1/messages/count_tokens` as fixed)
-- Verified `/v1/chat/completions` endpoint registered via `openai.transformer.ts` — works for OpenCode's `@ai-sdk/openai-compatible`
-- All 3 commits (Round 4-6) total: 9 files changed, 809 insertions, 149 deletions
-- 353/354 tests pass (1 pre-existing config-generator failure unrelated to changes)
-
-### Round 7 Context — Bug Fix & Custom Tools (commit 9a211b0+)
-
-- **Fixed config-generator test failure**: `generateCcrConfig("")` was calling `validateConfig()` before checking for null/empty input, causing it to throw instead of returning defaults. Fixed by reordering: null/empty check → defaults return, then validate non-null parsed config.
-- **Added standalone OpenCode custom tools** in `.opencode/tools/`:
-  - `ccr_search.js`: Search CCR semantic store (standalone, not plugin-dependent)
-  - `ccr_store.js`: Store context in CCR semantic store
-- These tools use the plain object export format (not `tool()` helper) for maximum compatibility
-- **354/354 tests now pass** (was 353/354)

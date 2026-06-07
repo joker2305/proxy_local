@@ -1,14 +1,14 @@
-const CCR_BASE_URL = process.env.CCR_BASE_URL || "http://localhost:4096";
+const CCR_BASE = process.env.CCR_BASE_URL || "http://localhost:4096";
 
-async function ccrFetch(path, options = {}) {
+async function ccrFetch(path, opts = {}) {
   try {
-    const resp = await fetch(`${CCR_BASE_URL}${path}`, {
-      ...options,
-      headers: { "Content-Type": "application/json", ...options.headers },
-      signal: AbortSignal.timeout(options.timeout || 3000),
+    const r = await fetch(`${CCR_BASE}${path}`, {
+      ...opts,
+      headers: { "Content-Type": "application/json", ...opts.headers },
+      signal: AbortSignal.timeout(opts.timeout || 3000),
     });
-    if (!resp.ok) return null;
-    return await resp.json();
+    if (!r.ok) return null;
+    return await r.json();
   } catch {
     return null;
   }
@@ -16,20 +16,22 @@ async function ccrFetch(path, options = {}) {
 
 export const CcrContextPlugin = async ({ project, client, directory, worktree }) => {
   const health = await ccrFetch("/api/health");
-  const ccrAvailable = health?.status === "ok";
+  const ccrUp = health?.status === "ok";
 
-  if (ccrAvailable) {
-    await client.app.log({
-      body: {
-        service: "ccr-context-plugin",
-        level: "info",
-        message: `CCR proxy connected at ${CCR_BASE_URL}`,
-        extra: {
-          providers: health.providers?.map((p) => p.name) || [],
-          semanticStore: health.semanticStore?.connected || false,
+  if (ccrUp) {
+    try {
+      await client.app.log({
+        body: {
+          service: "ccr-context-plugin",
+          level: "info",
+          message: `CCR connected at ${CCR_BASE}`,
+          extra: {
+            providers: health.providers?.map((p) => p.name) || [],
+            semanticStore: health.semanticStore?.connected || false,
+          },
         },
-      },
-    });
+      });
+    } catch {}
   }
 
   return {
@@ -41,29 +43,28 @@ export const CcrContextPlugin = async ({ project, client, directory, worktree })
 - Framework: Fastify. Transformer pipeline: Anthropic ↔ Unified(OpenAI) ↔ Provider-native.
 - Key files: routes.ts, router.ts, anthropic.transformer.ts, server.ts
 - Config: ~/.claude-code-router/config.json (JSON5). Model format: "providerName,modelName"
-- Architecture: CCR is a proxy service for OpenCode. Context via MCP/REST API, not transparent injection.
-- CCR Status: ${ccrAvailable ? "connected" : "unavailable"} at ${CCR_BASE_URL}
-- See AGENTS.md for full reference.`
+- Tests: vitest. Run: pnpm test or npx vitest run <path>
+- Architecture: CCR is a transparent proxy + opt-in context service for OpenCode.
+- See AGENTS.md for full reference including protocol gaps and ecosystem patterns.
+- CCR Status: ${ccrUp ? "connected" : "unavailable"} at ${CCR_BASE}`
       );
 
-      if (ccrAvailable) {
-        try {
-          const searchResult = await ccrFetch("/api/semantic/search", {
-            method: "POST",
-            body: JSON.stringify({
-              query: input.session?.title || "project context",
-              scope: "project",
-              limit: 3,
-              threshold: 0.4,
-            }),
-          });
-          if (searchResult?.results?.length > 0) {
-            const ctx = searchResult.results
-              .map((r, i) => `[${i + 1}] (${r.source || "semantic"}) ${(r.content || "").substring(0, 500)}`)
-              .join("\n");
-            output.context.push(`## CCR Semantic Context\n${ctx}`);
-          }
-        } catch {}
+      if (ccrUp) {
+        const sem = await ccrFetch("/api/semantic/search", {
+          method: "POST",
+          body: JSON.stringify({
+            query: input.session?.title || "project context",
+            scope: "project",
+            limit: 3,
+            threshold: 0.5,
+          }),
+        });
+        if (sem?.results?.length > 0) {
+          const ctx = sem.results
+            .map((r, i) => `[${i + 1}] (${r.source || "semantic"}) ${(r.content || "").substring(0, 500)}`)
+            .join("\n");
+          output.context.push(`## CCR Semantic Context\n${ctx}`);
+        }
       }
     },
 
@@ -94,7 +95,7 @@ export const CcrContextPlugin = async ({ project, client, directory, worktree })
     },
 
     event: async ({ event }) => {
-      if (event.type === "session.idle" && ccrAvailable) {
+      if (event.type === "session.idle" && ccrUp) {
         try {
           await ccrFetch("/api/context/collect", {
             method: "POST",

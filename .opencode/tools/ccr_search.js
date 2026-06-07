@@ -1,57 +1,46 @@
-const CCR_BASE_URL = process.env.CCR_BASE_URL || "http://localhost:4096";
+const CCR_BASE = process.env.CCR_BASE_URL || "http://localhost:4096";
 
-async function ccrFetch(path, options = {}) {
+async function ccrSemanticSearch(query, scope, limit, threshold) {
   try {
-    const resp = await fetch(`${CCR_BASE_URL}${path}`, {
-      ...options,
-      headers: { "Content-Type": "application/json", ...options.headers },
-      signal: AbortSignal.timeout(options.timeout || 5000),
+    const r = await fetch(`${CCR_BASE}/api/semantic/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query, scope: scope || "project", limit: limit || 5, threshold: threshold || 0.5 }),
+      signal: AbortSignal.timeout(5000),
     });
-    if (!resp.ok) return null;
-    return await resp.json();
-  } catch {
-    return null;
+    if (!r.ok) return { error: `CCR returned ${r.status}`, results: [] };
+    return await r.json();
+  } catch (e) {
+    return { error: e.message || "CCR unavailable", results: [] };
   }
 }
 
-export default {
-  description:
-    "Search the CCR semantic store for relevant project context, architecture decisions, and past session insights. " +
-    "Use this when you need background information about the project that may not be in the current files.",
+module.exports = {
+  name: "ccr_search",
+  description: "Search CCR semantic store for project context. Queries the local CCR proxy's vector store for relevant documents, code patterns, or architectural notes.",
   args: {
-    query: {
-      type: "string",
-      description: "Search query - what context are you looking for?",
+    type: "object",
+    properties: {
+      query: { type: "string", description: "Search query text" },
+      scope: { type: "string", description: "Search scope: project, session, or global", default: "project" },
+      limit: { type: "number", description: "Max results to return", default: 5 },
+      threshold: { type: "number", description: "Similarity threshold (0-1)", default: 0.5 },
     },
-    scope: {
-      type: "string",
-      description: "Scope: session, project, or reference (default: project)",
-    },
-    limit: {
-      type: "number",
-      description: "Max results to return (default: 5)",
-    },
+    required: ["query"],
   },
   async execute(args) {
-    const result = await ccrFetch("/api/semantic/search", {
-      method: "POST",
-      body: JSON.stringify({
-        query: args.query,
-        scope: args.scope || "project",
-        limit: args.limit || 5,
-        threshold: 0.4,
-      }),
-    });
-
-    if (!result || !result.results || result.results.length === 0) {
-      return `No results found in CCR semantic store for: "${args.query}"`;
+    const result = await ccrSemanticSearch(args.query, args.scope, args.limit, args.threshold);
+    if (result.error) {
+      return `CCR search failed: ${result.error}. Is the CCR proxy running at ${CCR_BASE}?`;
     }
-
+    if (!result.results || result.results.length === 0) {
+      return "No results found in CCR semantic store.";
+    }
     return result.results
-      .map(
-        (r, i) =>
-          `[${i + 1}] Scope: ${r.scope || "unknown"} | Topic: ${r.topic || "general"}\n    ${r.content || ""}`
-      )
+      .map((r, i) => {
+        const score = r.score ? ` (score: ${r.score.toFixed(3)})` : "";
+        return `[${i + 1}] ${r.source || "unknown"}${score}\n${(r.content || "").substring(0, 800)}`;
+      })
       .join("\n\n");
   },
 };
