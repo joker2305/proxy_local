@@ -292,3 +292,28 @@ CCR is a **transparent proxy and context service** for OpenCode. It should NOT m
 - Add OpenCode plugin that provides CCR routing capabilities via OpenCode's own plugin hooks
 - Evaluate which OpenCode plugin hooks (`chat.headers`, `chat.params`, `experimental.session.compacting`) can be used for CCR integration
 - Consider `opencode-llm-proxy` pattern (OpenCode SDK → providers) as alternative approach
+
+### Round 10 Context — All Middleware Opt-In
+
+**Problem**: Many middleware were enabled by default (`!== false`) even though they require external services (Redis, Qdrant, embedding service) or are enterprise features not needed for a local proxy. This caused unnecessary initialization overhead and confusing logs.
+
+**Changes made** (commit 1cb308c):
+
+Changed from `!== false` (default-on) to `=== true` (opt-in):
+- `SEMANTIC_CACHE_ENABLED`: requires embedding service
+- `REDIS_ENABLED`: requires Redis instance
+- `QUALITY_SCORER_ENABLED`: enterprise monitoring
+- `AUDIT_LOGGER_ENABLED`: enterprise logging
+- `COMPLIANCE_DISCLAIMER_ENABLED`: specific use case
+- `CACHE_REPORT_ENABLED`: monitoring feature
+- `STRUCTURED_OUTPUT_ENABLED`: requires JSON schema
+- `FINANCIAL_PII_MASKER_ENABLED`: financial-specific
+- `FALLBACK_CHAIN_ENABLED`: needs fallback config
+- `ADAPTIVE_PARAMS_ENABLED`: overlaps with OpenCode
+- `SECURITY_HARDENER_ENABLED`: needs config
+
+Kept default-on (`!== false`) — useful for all users:
+- `TOOL_COMPRESSOR_ENABLED`: truncates long tool results
+- `PROMPT_CACHING_ENABLED`: reduces token usage
+
+**Default CCR startup now**: Only tool compressor and prompt caching are active. Everything else requires explicit `"KEY": true` in config.json. This makes CCR a truly lightweight transparent proxy by default.
