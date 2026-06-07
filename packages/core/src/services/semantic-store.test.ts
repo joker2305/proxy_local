@@ -1,6 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// Mock pg module
 vi.mock('pg', () => ({
   Pool: vi.fn().mockImplementation(() => ({
     query: vi.fn(),
@@ -12,9 +11,23 @@ describe('SemanticStoreService', () => {
   let SemanticStoreService: any;
   let mockConfigService: any;
   let logger: any;
+  let mockEmbedService: any;
 
   beforeEach(async () => {
     vi.resetModules();
+
+    mockEmbedService = {
+      isAvailable: vi.fn().mockReturnValue(true),
+      embed: vi.fn().mockResolvedValue(new Array(768).fill(0.1)),
+    };
+
+    vi.doMock('../utils/embedding', () => ({
+      getEmbeddingService: vi.fn().mockReturnValue(mockEmbedService),
+      EmbeddingService: {
+        cosineSimilarity: vi.fn().mockReturnValue(0.95),
+      },
+    }));
+
     const mod = await import('./semantic-store');
     SemanticStoreService = mod.SemanticStoreService;
 
@@ -85,22 +98,13 @@ describe('SemanticStoreService', () => {
     });
   });
 
-  describe('generateEmbedding response parsing', () => {
-    it('should parse Ollama /api/embed format { embeddings: [[...]] }', async () => {
-      const mockFetch = vi.fn().mockResolvedValue({
-        ok: true,
-        json: () => Promise.resolve({
-          embeddings: [new Array(768).fill(0.1)],
-        }),
-      });
-      vi.stubGlobal('fetch', mockFetch);
-
-      // Create service and connect to trigger embedding generation
+  describe('embedding integration', () => {
+    it('should use unified EmbeddingService for embeddings', async () => {
       const { Pool } = await import('pg');
       const mockPool = {
         query: vi.fn()
-          .mockResolvedValueOnce({ rows: [{ '?column?': 1 }] }) // SELECT 1
-          .mockResolvedValueOnce({ rows: [{ id: 1 }] }), // INSERT RETURNING
+          .mockResolvedValueOnce({ rows: [{ '?column?': 1 }] })
+          .mockResolvedValueOnce({ rows: [{ id: 1 }] }),
         end: vi.fn(),
       };
       Pool.mockImplementation(() => mockPool);
@@ -115,77 +119,14 @@ describe('SemanticStoreService', () => {
       });
 
       expect(result).toEqual({ id: 1 });
-      // Verify the embedding was passed to the INSERT
+      expect(mockEmbedService.embed).toHaveBeenCalledWith('test content');
       const insertCall = mockPool.query.mock.calls[1];
-      expect(insertCall[1][6]).not.toBeNull(); // embedding column
+      expect(insertCall[1][6]).not.toBeNull();
     });
 
-    it('should parse Ollama legacy format { embedding: [...] }', async () => {
-      const mockFetch = vi.fn().mockResolvedValue({
-        ok: true,
-        json: () => Promise.resolve({
-          embedding: new Array(768).fill(0.2),
-        }),
-      });
-      vi.stubGlobal('fetch', mockFetch);
-
-      const { Pool } = await import('pg');
-      const mockPool = {
-        query: vi.fn()
-          .mockResolvedValueOnce({ rows: [{ '?column?': 1 }] })
-          .mockResolvedValueOnce({ rows: [{ id: 2 }] }),
-        end: vi.fn(),
-      };
-      Pool.mockImplementation(() => mockPool);
-
-      const service = new SemanticStoreService(mockConfigService, logger);
-      await service.connect();
-
-      const result = await service.upsert({
-        scope: 'reference',
-        topic: 'test',
-        content: 'test',
-      });
-
-      expect(result).toEqual({ id: 2 });
-    });
-
-    it('should parse OpenAI format { data: [{ embedding: [...] }] }', async () => {
-      const mockFetch = vi.fn().mockResolvedValue({
-        ok: true,
-        json: () => Promise.resolve({
-          data: [{ embedding: new Array(768).fill(0.3) }],
-        }),
-      });
-      vi.stubGlobal('fetch', mockFetch);
-
-      const { Pool } = await import('pg');
-      const mockPool = {
-        query: vi.fn()
-          .mockResolvedValueOnce({ rows: [{ '?column?': 1 }] })
-          .mockResolvedValueOnce({ rows: [{ id: 3 }] }),
-        end: vi.fn(),
-      };
-      Pool.mockImplementation(() => mockPool);
-
-      const service = new SemanticStoreService(mockConfigService, logger);
-      await service.connect();
-
-      const result = await service.upsert({
-        scope: 'reference',
-        topic: 'test',
-        content: 'test',
-      });
-
-      expect(result).toEqual({ id: 3 });
-    });
-
-    it('should handle unknown embedding format gracefully', async () => {
-      const mockFetch = vi.fn().mockResolvedValue({
-        ok: true,
-        json: () => Promise.resolve({ unknown: true }),
-      });
-      vi.stubGlobal('fetch', mockFetch);
+    it('should handle embedding unavailable gracefully', async () => {
+      mockEmbedService.isAvailable.mockReturnValue(false);
+      mockEmbedService.embed.mockResolvedValue(null);
 
       const { Pool } = await import('pg');
       const mockPool = {
@@ -205,10 +146,9 @@ describe('SemanticStoreService', () => {
         content: 'test',
       });
 
-      // Should still insert, just without embedding
       expect(result).toEqual({ id: 4 });
       const insertCall = mockPool.query.mock.calls[1];
-      expect(insertCall[1][6]).toBeNull(); // embedding should be null
+      expect(insertCall[1][6]).toBeNull();
     });
   });
 });

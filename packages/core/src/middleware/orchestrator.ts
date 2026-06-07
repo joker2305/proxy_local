@@ -43,7 +43,6 @@ import { ABTestingFramework, ABTestConfig } from "./ab-testing";
 import { FinancialPIIMasker, FinancialPIIMaskerConfig } from "./financial-pii-masker";
 import { checkHallucination } from "../engines/reasoning-engine";
 import type { ReasoningContext } from "../engines/reasoning-engine";
-import { MultiLevelCache, getMultiLevelCache, type CacheKey } from "../utils/multi-level-cache";
 import { SecurityHardener, getSecurityHardener } from "../utils/security-hardener";
 import { PrometheusExporter, getPrometheusExporter } from "../utils/prometheus";
 import { TrafficMirror, getTrafficMirror } from "../utils/traffic-mirror";
@@ -53,7 +52,6 @@ import { getEmbeddingService } from "../utils/embedding";
 import { redactObject } from "../utils/redactor";
 import { getPromptTemplateEngine } from "../utils/prompt-template";
 import { getWsPush } from "../utils/ws-push";
-import { getCacheWarmer } from "../utils/cache-warmer";
 import { getTaskQueue } from "../utils/task-queue";
 import { getSelfReflector } from "../utils/self-reflect";
 import { getTenantManager } from "../utils/tenant-isolation";
@@ -92,7 +90,6 @@ export interface MiddlewareConfig {
   redisCache: { enabled: boolean };
   selfReflect: { enabled: boolean; maxIterations: number };
   wsPush: { enabled: boolean };
-  cacheWarmer: { enabled: boolean };
   qualityScorer: { enabled: boolean };
   auditLogger: { enabled: boolean };
   slidingWindow: { enabled: boolean; maxTokens: number };
@@ -111,7 +108,6 @@ export interface MiddlewareConfig {
   structuredOutput: Partial<StructuredOutputConfig>;
   abTesting: Partial<ABTestConfig>;
   financialPIIMasker: Partial<FinancialPIIMaskerConfig>;
-  multiLevelCache: { enabled: boolean; l1MaxSize: number; l2Enabled: boolean; l3Enabled: boolean };
   securityHardener: { enabled: boolean };
   prometheus: { enabled: boolean };
   trafficMirror: { enabled: boolean; targets: any[] };
@@ -144,7 +140,6 @@ export class MiddlewareOrchestrator {
   public abTesting: ABTestingFramework;
   public financialPIIMasker: FinancialPIIMasker;
   public healthMonitor: HealthMonitor | null = null;
-  public multiLevelCache: MultiLevelCache | null = null;
   public securityHardener: SecurityHardener | null = null;
   public prometheusExporter: PrometheusExporter | null = null;
   public trafficMirror: TrafficMirror | null = null;
@@ -280,9 +275,6 @@ export class MiddlewareOrchestrator {
       wsPush: {
         enabled: this.configService.get("WS_PUSH_ENABLED") === true,
       },
-      cacheWarmer: {
-        enabled: this.configService.get("CACHE_WARMER_ENABLED") === true,
-      },
       qualityScorer: {
         enabled: this.configService.get("QUALITY_SCORER_ENABLED") === true,
       },
@@ -373,12 +365,6 @@ export class MiddlewareOrchestrator {
         maxConcurrent: this.configService.get("RATE_LIMITER_QUEUE_MAX_CONCURRENT") || 5,
         maxQueueSize: this.configService.get("RATE_LIMITER_QUEUE_MAX_SIZE") || 100,
       },
-      multiLevelCache: {
-        enabled: this.configService.get("MULTI_LEVEL_CACHE_ENABLED") === true,
-        l1MaxSize: this.configService.get("MULTI_LEVEL_CACHE_L1_MAX") || 1000,
-        l2Enabled: this.configService.get("MULTI_LEVEL_CACHE_L2_ENABLED") === true,
-        l3Enabled: this.configService.get("MULTI_LEVEL_CACHE_L3_ENABLED") === true,
-      },
       securityHardener: {
         enabled: this.configService.get("SECURITY_HARDENER_ENABLED") === true,
       },
@@ -413,7 +399,7 @@ export class MiddlewareOrchestrator {
     // Initialize reasoning cache
     await this.reasoningCache.initialize();
 
-    // Initialize embedding service (needed by SemanticCache + MultiLevelCache L3)
+    // Initialize embedding service (needed by SemanticCache)
     try {
       const embeddingProvider = this.configService.get('EMBEDDING_PROVIDER') || 'ollama';
       const embeddingBaseUrl = this.configService.get('EMBEDDING_BASE_URL') || 'http://localhost:11434';
@@ -440,16 +426,6 @@ export class MiddlewareOrchestrator {
       }
     } catch (e: any) {
       this.logger.debug(`  RedisCache L2: not available (${e?.message})`);
-    }
-
-    // Initialize cache warmer
-    try {
-      const warmer = getCacheWarmer();
-      if (warmer) {
-        this.logger.info("  CacheWarmer: available");
-      }
-    } catch (e: any) {
-      this.logger.debug(`  CacheWarmer: not available (${e?.message})`);
     }
 
     // Initialize task queue
@@ -506,22 +482,7 @@ export class MiddlewareOrchestrator {
     this.logger.info(`  ABTesting: ${this.abTesting.getStats().enabled ? 'enabled' : 'disabled'}`);
     this.logger.info(`  FinancialPIIMasker: ${this.financialPIIMasker.getStats().enabled ? 'enabled' : 'disabled'}`);
 
-    // Initialize v2 infrastructure modules
-    try {
-      const mlcConfig = this.middlewareConfig.multiLevelCache || { enabled: true, l1MaxSize: 1000, l2Enabled: true, l3Enabled: false };
-      if (mlcConfig.enabled) {
-        this.multiLevelCache = getMultiLevelCache({
-          l1: { maxSize: mlcConfig.l1MaxSize },
-          l2: { maxSize: 10000 },
-          l3Enabled: mlcConfig.l3Enabled,
-        }, this.logger);
-        await this.multiLevelCache.initialize();
-        this.logger.info(`  MultiLevelCache: L1(memory) + L2(redis:${this.multiLevelCache.l2.isConnected()}) + L3(qdrant:${mlcConfig.l3Enabled})`);
-      }
-    } catch (e: any) {
-      this.logger.debug(`  MultiLevelCache: skipped (${e?.message})`);
-    }
-
+    // Initialize security hardener
     try {
       if (this.middlewareConfig.securityHardener?.enabled !== false) {
         this.securityHardener = getSecurityHardener(undefined, this.logger);
@@ -641,12 +602,6 @@ export class MiddlewareOrchestrator {
       if (queue && typeof (queue as any).shutdown === 'function') await (queue as any).shutdown();
     } catch (e: any) { this.logger?.debug(`Shutdown TaskQueue: ${e?.message}`); }
 
-    // Shutdown cache warmer
-    try {
-      const warmer = getCacheWarmer();
-      if (warmer) warmer.stop();
-    } catch (e: any) { this.logger?.debug(`Shutdown CacheWarmer: ${e?.message}`); }
-
     // Shutdown WebSocket push
     try {
       const wsPush = getWsPush();
@@ -757,8 +712,13 @@ export class MiddlewareOrchestrator {
       if (this.qdrantCache['config']?.enabled) {
         try {
           const queryText = this.extractQuerySummary(req.body);
+          let queryVector: number[] = [];
+          const embedSvc = getEmbeddingService(undefined, this.logger);
+          if (embedSvc.isAvailable()) {
+            queryVector = (await embedSvc.embed(queryText)) || [];
+          }
           const qdrantResult = await withTimeout(
-            this.qdrantCache.lookup(queryText, []),
+            this.qdrantCache.lookup(queryText, queryVector),
             150,
             null,
             "qdrantCache.lookup",
@@ -994,7 +954,12 @@ export class MiddlewareOrchestrator {
 
         if (this.qdrantCache['config']?.enabled) {
           const queryText = this.extractQuerySummary(req.body);
-          this.qdrantCache.store(queryText, [], responseBody, {
+          let storeVector: number[] = [];
+          const embedSvc = getEmbeddingService(undefined, this.logger);
+          if (embedSvc.isAvailable()) {
+            storeVector = (await embedSvc.embed(queryText).catch(() => null)) || [];
+          }
+          this.qdrantCache.store(queryText, storeVector, responseBody, {
             model: (req as any).model || 'unknown',
             provider: (req as any).provider || 'unknown',
             sessionId: context.sessionId,
@@ -1381,7 +1346,6 @@ export class MiddlewareOrchestrator {
     qdrantCache?: any;
     cacheReport?: any;
     v2?: {
-      multiLevelCache?: any;
       securityHardener?: any;
       prometheus?: any;
       trafficMirror?: any;
@@ -1426,7 +1390,6 @@ export class MiddlewareOrchestrator {
         return null;
       })(),
       v2: {
-        multiLevelCache: this.multiLevelCache?.getAllStats() || null,
         securityHardener: this.securityHardener ? { enabled: true } : null,
         prometheus: this.prometheusExporter ? { enabled: true } : null,
         trafficMirror: this.trafficMirror?.getComparisonStats() || null,

@@ -317,3 +317,69 @@ Kept default-on (`!== false`) — useful for all users:
 - `PROMPT_CACHING_ENABLED`: reduces token usage
 
 **Default CCR startup now**: Only tool compressor and prompt caching are active. Everything else requires explicit `"KEY": true` in config.json. This makes CCR a truly lightweight transparent proxy by default.
+
+### Round 11 Context — Streaming Cache (Phase 1)
+
+**Problem**: The semantic cache explicitly skipped all streaming requests (`shouldSkip()` returned `true` for `stream: true`). Since OpenCode uses 100% streaming, the cache was completely useless. Additionally, cached non-streaming responses couldn't be replayed as SSE streams.
+
+**Architecture**: Cache flow for streaming:
+1. Request arrives with `stream: true` → check `SemanticCache.lookupStreaming()` → hit → `SSEReplayer` replays as SSE
+2. Miss → upstream request → `formatResponse` wraps stream → `SSECollector` collects chunks in background → client gets immediate response → after stream completes, `SemanticCache.storeStreaming()` stores complete response
+3. Next identical request → cache hit → replayed SSE (chunked into 20-char pieces for realistic streaming feel)
+
+**Files created**:
+- `packages/core/src/utils/sse-collector.ts`: SSE response collector — feeds raw SSE text, detects format (anthropic/openai), assembles complete response from chunks, generates deterministic streaming cache keys (hash of model + messages + provider)
+- `packages/core/src/utils/sse-replayer.ts`: SSE response replayer — converts cached complete response back into SSE ReadableStream, supports both OpenAI (`chat.completion.chunk`) and Anthropic (`message_start`/`content_block_delta`/`message_stop`) formats, chunks content into 20-char pieces for realistic streaming feel, handles text/thinking/tool_use blocks
+
+**Files modified**:
+- `packages/core/src/middleware/semantic-cache.ts`:
+  - Added `streamingData` field to `CacheEntry` (format + completeResponse)
+  - Added `storeStreaming(collected: CollectedSSE)` — stores collected SSE with format metadata
+  - Added `lookupStreaming()` — returns `{completeResponse, format}` for replay
+  - Fixed `shouldSkip()` — no longer skips `stream: true` requests
+  - Raised default `temperatureThreshold` from `0.5` to `0.99` (only skip extreme temperature)
+  - Removed `"stream"` from default `skipPatterns`
+- `packages/core/src/api/routes.ts`:
+  - `formatResponse()` — integrated `SSECollector` to collect SSE in background during streaming, calls `semanticCache.storeStreaming()` after stream completes
+  - `handleTransformerEndpoint()` — added streaming cache lookup before upstream request, returns replayed SSE on cache hit
+  - Added `x-ccr-cache-force-refresh` header support (set to `"true"` to bypass cache)
+  - Added `X-CCR-Cache-Status` response header (`HIT` or `MISS`)
+- `packages/core/src/utils/sse/index.ts`: Re-exported new SSE utilities
+- `packages/core/src/middleware/semantic-cache.test.ts`: Fixed temperature threshold test to explicitly set threshold
+
+**Verification**: All 354 tests pass, all packages build successfully.
+
+### Round 12 Context — Embedding Unification + Cache Cleanup + MCP Enhancement
+
+**Three changes in this round**:
+
+**1. Embedding Unification (Phase 2)**
+- **Problem**: Three separate embedding implementations existed (`utils/embedding.ts`, `services/semantic-store.ts`, `services/context-store.ts`), each with its own fetch logic and format parsing.
+- **Solution**: Made `semantic-store.ts` and `context-store.ts` delegate to the unified `getEmbeddingService()` singleton instead of implementing their own embedding.
+- Removed `ContextStoreConfig.embeddingEndpoint` field — no longer needed.
+- `semantic-store.ts`: Replaced 45-line `generateEmbedding()` with 2-line delegation to `getEmbeddingService()`.
+- `context-store.ts`: Replaced 15-line `getEmbedding()` and 12-line `cosineSimilarity()` with delegation to `getEmbeddingService()` + `EmbeddingService.cosineSimilarity()`.
+- Updated `semantic-store.test.ts` to mock `../utils/embedding` module instead of raw `fetch`.
+
+**2. Cache Architecture Cleanup (Phase 3)**
+- **Removed dead code**:
+  - `MultiLevelCache` (496 lines): Initialized in orchestrator but never called in request pipeline. Had its own L1/L2/L3 implementation duplicating SemanticCache+RedisCache+QdrantCache. Removed from orchestrator config, initialization, stats, shutdown, and routes (`/api/cache/multilevel` endpoints).
+  - `CacheWarmer`: Never started (`start()` never called). Removed initialization and shutdown.
+- **Fixed QdrantCache bug**: `lookup()` was called with empty vector `[]` at orchestrator:716, making vector similarity search useless. Now passes actual embedding from `getEmbeddingService()`. Same fix for `store()`.
+
+**3. Enhanced MCP Tools (Phase 4)**
+Added 3 new MCP tools to `/api/mcp` endpoint:
+- `cache_invalidate`: Clears semantic cache
+- `context_list`: Lists stored context entries with scope/topic filtering
+- `context_delete`: Deletes stored context by scope + topic
+Enhanced `cache_status`: Now includes semantic cache stats (entries, hits) from `SemanticCache.getStats()`.
+
+**Files modified**:
+- `packages/core/src/services/semantic-store.ts`: Delegates to unified `getEmbeddingService()`
+- `packages/core/src/services/context-store.ts`: Delegates to unified `getEmbeddingService()`
+- `packages/core/src/services/semantic-store.test.ts`: Updated mocks for unified embedding
+- `packages/core/src/middleware/orchestrator.ts`: Removed MultiLevelCache/CacheWarmer (~40 lines), fixed QdrantCache vector passing
+- `packages/core/src/api/routes.ts`: Removed `/api/cache/multilevel` endpoints (~24 lines)
+- `packages/server/src/server.ts`: Added 3 MCP tools + enhanced `cache_status`
+
+**Verification**: All 352 tests pass, all packages build successfully.

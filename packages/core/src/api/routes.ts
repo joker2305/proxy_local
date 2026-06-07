@@ -7,6 +7,9 @@ import {
 import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
+import { SSECollector } from "@/utils/sse-collector";
+import { SSEReplayer } from "@/utils/sse-replayer";
+import { generateStreamingCacheKey } from "@/utils/sse-collector";
 import { version } from "../../package.json";
 import { ConfigService } from "@/services/config";
 import { ProviderService } from "@/services/provider";
@@ -220,6 +223,29 @@ async function handleTransformerEndpoint(
       reply.code(mockResp.statusCode);
       return mockResp.response;
     }
+  }
+
+  // Streaming cache lookup (only for streaming requests)
+  if (body.stream === true) {
+    const forceRefresh = req.headers['x-ccr-cache-force-refresh'] === 'true';
+    if (!forceRefresh) {
+      const orchestrator = (fastify as any)._server?.orchestrator;
+      if (orchestrator?.semanticCache) {
+        const cached = orchestrator.semanticCache.lookupStreaming(body, {
+          model: body.model,
+        });
+        if (cached) {
+          fastify.log.info(`StreamingCache: HIT — replaying cached response (format=${cached.format}, model=${body.model})`);
+          reply.header("Content-Type", "text/event-stream");
+          reply.header("Cache-Control", "no-cache");
+          reply.header("Connection", "keep-alive");
+          reply.header("X-CCR-Cache-Status", "HIT");
+          const replayed = SSEReplayer.replay(cached.completeResponse, cached.format);
+          return reply.send(replayed);
+        }
+      }
+    }
+    reply.header("X-CCR-Cache-Status", "MISS");
   }
 
   try {
@@ -812,22 +838,22 @@ function parseSSEToMessage(fullPayload: string): any | null {
 }
 
 function formatResponse(response: any, reply: FastifyReply, body: any, req?: any, orchestrator?: any) {
-  // Set HTTP status code
   if (!response.ok) {
     reply.code(response.status);
   }
 
-  // Handle streaming response
   const isStream = body.stream === true;
   if (isStream) {
     reply.header("Content-Type", "text/event-stream");
     reply.header("Cache-Control", "no-cache");
     reply.header("Connection", "keep-alive");
 
-    if (req && orchestrator && response.body) {
+    if (req && response.body) {
       const originalStream = response.body;
       const collectedChunks: string[] = [];
       const decoder = new TextDecoder();
+      const isAnthropic = (req.url || '').includes('/v1/messages');
+      const collector = new SSECollector(isAnthropic ? 'anthropic' : 'openai');
 
       const wrappedStream = new ReadableStream({
         start(controller) {
@@ -841,13 +867,28 @@ function formatResponse(response: any, reply: FastifyReply, body: any, req?: any
                     const fullPayload = collectedChunks.join('');
                     const finalMessage = parseSSEToMessage(fullPayload);
                     if (finalMessage && !finalMessage.error) {
-                      orchestrator.onPostResponse(req, finalMessage).catch(() => {});
+                      if (orchestrator) {
+                        orchestrator.onPostResponse(req, finalMessage).catch(() => {});
+                      }
+
+                      if (orchestrator?.semanticCache) {
+                        const collected = collector.getCollected();
+                        if (collected && collected.completeResponse) {
+                          orchestrator.semanticCache.storeStreaming(
+                            body,
+                            collected,
+                            { model: (req as any).model || body.model }
+                          );
+                        }
+                      }
                     }
                   } catch {}
                   controller.close();
                   return;
                 }
-                collectedChunks.push(decoder.decode(value, { stream: true }));
+                const text = decoder.decode(value, { stream: true });
+                collectedChunks.push(text);
+                collector.feed(text);
                 controller.enqueue(value);
               }
             } catch (err) {
@@ -862,7 +903,6 @@ function formatResponse(response: any, reply: FastifyReply, body: any, req?: any
 
     return reply.send(response.body);
   } else {
-    // Handle regular JSON response
     return response.json();
   }
 }
@@ -1920,31 +1960,6 @@ export const registerApiRoutes = async (
       reply.send(router.getAllMetrics());
     } catch (e: any) {
       reply.code(503).send({ error: 'AdaptiveRouter not available', message: e.message });
-    }
-  });
-
-  fastify.get('/api/cache/multilevel', async (req: any, reply: any) => {
-    try {
-      const { getMultiLevelCache } = require('../utils/multi-level-cache');
-      const cache = getMultiLevelCache(undefined, req.log);
-      reply.send(cache.getAllStats());
-    } catch (e: any) {
-      reply.code(503).send({ error: 'MultiLevelCache not available', message: e.message });
-    }
-  });
-
-  fastify.post('/api/cache/multilevel/invalidate', async (req: any, reply: any) => {
-    try {
-      const { getMultiLevelCache } = require('../utils/multi-level-cache');
-      const cache = getMultiLevelCache(undefined, req.log);
-      const { pattern } = req.body || {};
-      const result = pattern
-        ? await cache.invalidate(pattern)
-        : { l1: cache.l1.invalidate(''), l2: 0 };
-      if (!pattern) cache.l1.clear();
-      reply.send({ success: true, ...result });
-    } catch (e: any) {
-      reply.code(500).send({ error: e.message });
     }
   });
 

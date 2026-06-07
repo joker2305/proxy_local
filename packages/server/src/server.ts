@@ -988,6 +988,41 @@ export const createServer = async (config: any): Promise<any> => {
                 description: "Get CCR semantic cache status and hit/miss statistics",
                 inputSchema: { type: "object", properties: {} },
               },
+              {
+                name: "cache_invalidate",
+                description: "Invalidate cache entries. Clears semantic cache or specific provider cache",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    provider: { type: "string", description: "Provider name to invalidate (optional, clears all if omitted)" },
+                    model: { type: "string", description: "Model name to invalidate (optional)" },
+                  },
+                },
+              },
+              {
+                name: "context_list",
+                description: "List stored context entries by scope and topic",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    scope: { type: "string", enum: ["session", "project", "reference"], description: "Filter by scope" },
+                    topic: { type: "string", description: "Filter by topic (supports partial match)" },
+                    limit: { type: "number", description: "Max results (default 10)" },
+                  },
+                },
+              },
+              {
+                name: "context_delete",
+                description: "Delete stored context entries by scope and topic",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    scope: { type: "string", description: "Scope of entries to delete" },
+                    topic: { type: "string", description: "Topic of entries to delete" },
+                  },
+                  required: ["scope", "topic"],
+                },
+              },
             ],
           },
           id,
@@ -1050,6 +1085,14 @@ export const createServer = async (config: any): Promise<any> => {
 
         if (toolName === "cache_status") {
           const health = await semanticStore.healthCheck();
+          let cacheStats: any = {};
+          try {
+            const srv = getServer(app);
+            const orch = (srv as any)?._server?.orchestrator;
+            if (orch?.semanticCache) {
+              cacheStats = orch.semanticCache.getStats();
+            }
+          } catch {}
           return {
             jsonrpc: "2.0",
             result: {
@@ -1057,9 +1100,63 @@ export const createServer = async (config: any): Promise<any> => {
                 type: "text",
                 text: JSON.stringify({
                   semanticStore: health,
+                  semanticCache: cacheStats,
                   timestamp: new Date().toISOString(),
                 }),
               }],
+            },
+            id,
+          };
+        }
+
+        if (toolName === "cache_invalidate") {
+          let cleared = false;
+          try {
+            const srv = getServer(app);
+            const orch = (srv as any)?._server?.orchestrator;
+            if (orch?.semanticCache) {
+              orch.semanticCache.clear();
+              cleared = true;
+            }
+          } catch {}
+          return {
+            jsonrpc: "2.0",
+            result: {
+              content: [{ type: "text", text: JSON.stringify({ success: true, cacheCleared: cleared }) }],
+            },
+            id,
+          };
+        }
+
+        if (toolName === "context_list") {
+          const results = await semanticStore.search(args.topic || "", {
+            scope: args.scope,
+            limit: args.limit || 10,
+          });
+          return {
+            jsonrpc: "2.0",
+            result: {
+              content: [{
+                type: "text",
+                text: JSON.stringify(results.map((r: any) => ({
+                  id: r.id,
+                  scope: r.scope,
+                  topic: r.topic,
+                  content: r.content?.substring(0, 200),
+                  similarity: r.similarity,
+                })), null, 2),
+              }],
+            },
+            id,
+          };
+        }
+
+        if (toolName === "context_delete") {
+          const count = await semanticStore.delete(args.scope, args.topic);
+          return {
+            jsonrpc: "2.0",
+            result: {
+              content: [{ type: "text", text: JSON.stringify({ deleted: count, scope: args.scope, topic: args.topic }) }],
             },
             id,
           };

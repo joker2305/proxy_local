@@ -1,12 +1,5 @@
 import { ConfigService } from './config';
-
-/**
- * Semantic store service backed by Postgres + pgvector.
- * Provides document storage with vector embeddings for similarity search.
- *
- * Graceful degradation: if Postgres is unavailable, all operations
- * return empty results instead of crashing the gateway.
- */
+import { getEmbeddingService } from '../utils/embedding';
 
 export interface SemanticDocument {
   id?: number;
@@ -63,7 +56,6 @@ export class SemanticStoreService {
 
     this.connecting = true;
     try {
-      // Dynamic import of pg to avoid hard dependency
       const pg = await import('pg');
       const { Pool } = pg;
       this.pool = new Pool({
@@ -73,7 +65,6 @@ export class SemanticStoreService {
         connectionTimeoutMillis: 5000,
       }) as unknown as Pool;
 
-      // Test connection
       await this.pool.query('SELECT 1');
       this.connected = true;
       this.logger.info('SemanticStore: connected to Postgres');
@@ -102,10 +93,6 @@ export class SemanticStoreService {
     return this.connected;
   }
 
-  /**
-   * Upsert a document into the semantic store.
-   * If an embedding endpoint is configured, generates an embedding automatically.
-   */
   async upsert(doc: SemanticDocument): Promise<{ id: number } | null> {
     if (!this.connected || !this.pool) {
       const connected = await this.connect();
@@ -115,7 +102,6 @@ export class SemanticStoreService {
     try {
       let embedding: number[] | null = null;
 
-      // Generate embedding if endpoint is configured
       if (this.config?.semanticStore?.embeddingEndpoint && doc.content) {
         embedding = await this.generateEmbedding(doc.content);
       }
@@ -148,10 +134,6 @@ export class SemanticStoreService {
     }
   }
 
-  /**
-   * Search for similar documents using cosine similarity.
-   * If no embedding endpoint is configured, falls back to text-based search.
-   */
   async search(
     query: string,
     options: {
@@ -170,7 +152,6 @@ export class SemanticStoreService {
       const limit = options.limit || 10;
       const threshold = options.threshold || 0.5;
 
-      // If we have an embedding endpoint, use vector search
       if (this.config?.semanticStore?.embeddingEndpoint) {
         const embedding = await this.generateEmbedding(query);
         if (!embedding) return [];
@@ -200,7 +181,6 @@ export class SemanticStoreService {
         return result.rows.map(this.mapRowToSearchResult);
       }
 
-      // Fallback: text-based search using ILIKE
       let sql = `
         SELECT id, scope, topic, depth, trust, source, content, metadata, created_at,
                0.5 AS similarity
@@ -228,9 +208,6 @@ export class SemanticStoreService {
     }
   }
 
-  /**
-   * Delete documents by scope and topic.
-   */
   async delete(scope: string, topic: string): Promise<number> {
     if (!this.connected || !this.pool) {
       const connected = await this.connect();
@@ -249,9 +226,6 @@ export class SemanticStoreService {
     }
   }
 
-  /**
-   * Check the health of the Postgres connection.
-   */
   async healthCheck(): Promise<{ connected: boolean; documentCount?: number; error?: string }> {
     try {
       if (!this.pool) {
@@ -271,55 +245,9 @@ export class SemanticStoreService {
     }
   }
 
-  /**
-   * Generate an embedding vector using the configured endpoint.
-   * Supports Ollama /api/embed format.
-   */
   private async generateEmbedding(text: string): Promise<number[] | null> {
-    const endpoint = this.config?.semanticStore?.embeddingEndpoint;
-    const model = this.config?.semanticStore?.embeddingModel || 'nomic-embed-text';
-
-    if (!endpoint) return null;
-
-    try {
-      // Truncate text to avoid excessive payload size
-      const truncated = text.slice(0, 8000);
-
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, input: truncated }),
-        signal: AbortSignal.timeout(10000),
-      });
-
-      if (!response.ok) {
-        this.logger.warn(`Embedding endpoint returned ${response.status}`);
-        return null;
-      }
-
-      const data = await response.json() as any;
-
-      // Ollama /api/embed format: { embeddings: [[...]] }
-      if (Array.isArray(data.embeddings?.[0])) {
-        return data.embeddings[0];
-      }
-
-      // Ollama legacy /api/embeddings format: { embedding: [...] }
-      if (Array.isArray(data.embedding)) {
-        return data.embedding;
-      }
-
-      // OpenAI format: { data: [{ embedding: [...] }] }
-      if (data.data?.[0]?.embedding) {
-        return data.data[0].embedding;
-      }
-
-      this.logger.warn(`Unknown embedding response format: ${JSON.stringify(Object.keys(data))}`);
-      return null;
-    } catch (error: any) {
-      this.logger.warn(`Embedding generation failed: ${error.message}`);
-      return null;
-    }
+    const service = getEmbeddingService(undefined, this.logger);
+    return service.embed(text);
   }
 
   private mapRowToSearchResult(row: any): SearchResult {
