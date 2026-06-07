@@ -77,14 +77,14 @@ The proxy exposes `POST /v1/messages` as its primary endpoint. It converts betwe
 
 ### Known Protocol Gaps (vs Anthropic spec and claw-code reference)
 
-1. **Error format**: Returns `{error: {message, type, code}}` instead of Anthropic's `{type: "error", error: {type, message}}`
+1. ~~**Error format**: Returns `{error: {message, type, code}}` instead of Anthropic's `{type: "error", error: {type, message}}`~~ — **Fixed** in Round 8 (middleware.ts)
 2. ~~**No `/v1/models` endpoint**: Model listing not exposed~~ — **Fixed** in server.ts
 3. ~~**No `/v1/messages/count_tokens`**: Token counting endpoint missing~~ — **Fixed** in server.ts
 4. **Usage in `message_start`**: Always reports `input_tokens: 0` — real Anthropic includes input tokens here
 5. **Synthetic thinking signatures**: Non-Anthropic providers get fake signatures (timestamps), not cryptographic ones
-6. **No request validation**: Missing schema checks on required fields (`max_tokens`, `messages`, `model`)
+6. ~~**No request validation**: Missing schema checks on required fields (`max_tokens`, `messages`, `model`)~~ — **Fixed** in Round 8 (server.ts preHandler)
 7. **`anthropic-version`/`anthropic-beta` headers**: Stripped for non-Anthropic but not validated on incoming requests
-8. **Orphaned tool messages**: No sanitization of tool messages without matching assistant tool_calls (claw-code does this)
+8. ~~**Orphaned tool messages**: No sanitization of tool messages without matching assistant tool_calls (claw-code does this)~~ — **Fixed** in Round 8 (server.ts `sanitizeOrphanedToolMessages`)
 9. **Schema normalization**: Tool input schemas not normalized with `properties: {}` + `additionalProperties: false` for OpenAI strict mode
 
 ### OpenCode Integration
@@ -235,3 +235,12 @@ Completed operational tooling:
 - **Provider**: `@ai-sdk/openai-compatible` with `baseURL: "http://localhost:4096/v1"` — model format `"providerName,modelName"`
 - **MCP**: `"type": "remote", "url": "http://localhost:4096/api/mcp"` — tools: `semantic_search`, `semantic_store`, `health_check`
 - **REST API**: `/api/context/*` endpoints for direct programmatic access
+
+### Round 8 Context — Protocol Gap Fixes
+
+Fixed 3 protocol gaps:
+- **Error format** (gap #1): `errorHandler` in `middleware.ts` now returns `{type: "error", error: {type, message}}` for Anthropic endpoints (`/v1/messages`), with proper error type mapping (400→invalid_request_error, 401→authentication_error, 429→rate_limit_error, etc.). Non-Anthropic endpoints keep original format.
+- **Request validation** (gap #6): PreHandler in `server.ts` validates `model` and `messages` fields for both `/v1/messages` and `/v1/chat/completions`. Returns proper Anthropic-format errors for the messages endpoint.
+- **Orphaned tool messages** (gap #8): `sanitizeOrphanedToolMessages()` removes tool messages with no matching `tool_call_id` in preceding assistant messages, preventing 400 errors from upstream providers.
+
+**Remaining gaps**: #4 (usage in message_start), #5 (synthetic signatures), #7 (header validation), #9 (schema normalization)

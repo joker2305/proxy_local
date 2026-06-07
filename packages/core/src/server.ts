@@ -90,6 +90,36 @@ function createApp(options: FastifyServerOptions = {}): FastifyInstance {
 }
 
 // Server class
+function sanitizeOrphanedToolMessages(body: any): void {
+  if (!body?.messages || !Array.isArray(body.messages)) return;
+
+  const cleaned: any[] = [];
+  for (let i = 0; i < body.messages.length; i++) {
+    const msg = body.messages[i];
+
+    if (msg.role === 'tool') {
+      let hasMatchingToolCall = false;
+      for (let j = i - 1; j >= 0; j--) {
+        const prev = body.messages[j];
+        if (prev.role === 'assistant' && Array.isArray(prev.tool_calls)) {
+          hasMatchingToolCall = prev.tool_calls.some(
+            (tc: any) => tc.id === msg.tool_call_id
+          );
+          if (hasMatchingToolCall) break;
+        }
+        if (prev.role === 'user') break;
+      }
+      if (!hasMatchingToolCall) continue;
+    }
+
+    cleaned.push(msg);
+  }
+
+  if (cleaned.length !== body.messages.length) {
+    body.messages = cleaned;
+  }
+}
+
 class Server {
   private app: FastifyInstance;
   configService: ConfigService;
@@ -184,6 +214,34 @@ class Server {
             if (!body.stream) {
               body.stream = false;
             }
+
+            if (url.pathname === "/v1/messages") {
+              if (!body.model || typeof body.model !== 'string') {
+                return reply.code(400).send({
+                  type: "error",
+                  error: { type: "invalid_request_error", message: "model: Required field is missing" },
+                });
+              }
+              if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
+                return reply.code(400).send({
+                  type: "error",
+                  error: { type: "invalid_request_error", message: "messages: Required field is missing" },
+                });
+              }
+            }
+            if (url.pathname === "/v1/chat/completions") {
+              if (!body.model || typeof body.model !== 'string') {
+                return reply.code(400).send({
+                  error: { message: "model is required", type: "invalid_request_error", code: "invalid_request" },
+                });
+              }
+              if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
+                return reply.code(400).send({
+                  error: { message: "messages is required and must be a non-empty array", type: "invalid_request_error", code: "invalid_request" },
+                });
+              }
+            }
+            sanitizeOrphanedToolMessages(body);
           }
           done();
         });
