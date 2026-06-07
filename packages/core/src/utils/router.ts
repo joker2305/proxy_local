@@ -10,19 +10,26 @@ import { TokenizerService } from "../services/tokenizer";
 import { resolveModelAlias } from "./model-alias";
 import { resolveTier, resolveScenarioModel } from "./tier-resolver";
 import type { TierResolution } from "./tier-resolver";
-import { analyzeReasoning, buildContextInjection } from "../engines/reasoning-engine";
-import { getAdaptiveRouter } from "./adaptive-router";
-import { getAdaptiveParameterTuner } from "./adaptive-params";
-import { classifyRequest, extractLastUserMessage } from "./task-classifier";
-import type { TaskTier, TaskCategory } from "./task-classifier";
-import { getThinkingStrategyManager } from "./thinking-strategy";
 
 // ==========================================================================
-// Provider fallback: config-driven via "fallback" section in config.json
-// No hardcoded provider names — all fallback logic reads from config
+// Transparent Router for OpenCode
+//
+// Design principle: CCR is a transparent proxy. Routing decisions should be
+// made by the client (OpenCode), not by the proxy. The router only:
+// 1. Parses model format (provider,model) from the request
+// 2. Supports slash-prefix convenience (openai/gpt-4 → openai,gpt-4)
+// 3. Supports model alias for backward compatibility
+// 4. Supports config-driven tier/scenario routing (opt-in via config)
+// 5. Supports config-driven health fallback
+//
+// Removed (OpenCode handles these):
+// - Task classification + strategy selection
+// - Thinking strategy manager
+// - Adaptive router scoring
+// - Adaptive parameter tuning
+// - Reasoning-aware routing with context injection
 // ==========================================================================
 
-// Types from @anthropic-ai/sdk
 interface Tool {
   name: string;
   description?: string;
@@ -106,7 +113,6 @@ const getProjectSpecificRouter = async (
   req: any,
   configService: ConfigService
 ) => {
-  // Check if there is project-specific configuration
   if (req.sessionId) {
     const project = await searchProjectBySession(req.sessionId);
     if (project) {
@@ -117,7 +123,6 @@ const getProjectSpecificRouter = async (
         `${req.sessionId}.json`
       );
 
-      // First try to read sessionConfig file
       try {
         const sessionConfig = JSON.parse(await readFile(sessionConfigPath, "utf8"));
         if (sessionConfig && sessionConfig.Router) {
@@ -132,10 +137,24 @@ const getProjectSpecificRouter = async (
       } catch {}
     }
   }
-  return undefined; // Return undefined to use original configuration
+  return undefined;
 };
 
-const getUseModel = async (
+const SLASH_PREFIX_MAP: Record<string, string> = {
+  'openai': 'openai',
+  'xai': 'xai',
+  'qwen': 'dashscope',
+  'kimi': 'dashscope',
+  'deepseek': 'deepseek',
+  'anthropic': 'anthropic',
+  'google': 'google',
+  'groq': 'groq',
+  'glm': 'glm',
+  'cerebras': 'cerebras',
+  'openrouter': 'openrouter',
+};
+
+const resolveModel = async (
   req: any,
   tokenCount: number,
   configService: ConfigService,
@@ -145,43 +164,28 @@ const getUseModel = async (
   const providers = configService.get<any[]>("providers") || [];
   const Router = projectSpecificRouter || configService.get("Router");
 
-  // Slash-prefix routing: "openai/gpt-4.1" → "openai,gpt-4.1"
+  // Step 1: Slash-prefix routing: "openai/gpt-4.1" → "openai,gpt-4.1"
   if (req.body.model?.includes('/') && !req.body.model.includes(',')) {
     const [prefix, ...rest] = req.body.model.split('/');
     const actualModel = rest.join('/');
-    const providerMap: Record<string, string> = {
-      'openai': 'openai',
-      'xai': 'xai',
-      'qwen': 'dashscope',
-      'kimi': 'dashscope',
-      'deepseek': 'deepseek',
-      'anthropic': 'anthropic',
-      'google': 'google',
-      'groq': 'groq',
-    };
-    const resolvedProvider = providerMap[prefix.toLowerCase()];
+    const resolvedProvider = SLASH_PREFIX_MAP[prefix.toLowerCase()];
     if (resolvedProvider) {
       req.log.info(`Slash-prefix routing: ${req.body.model} → ${resolvedProvider},${actualModel}`);
       req.body.model = `${resolvedProvider},${actualModel}`;
     }
   }
 
-  // === Tier-based routing: interpret Claude model names as tier indicators ===
-  // Instead of a static ModelAlias mapping, resolve the model name to a tier
-  // (premium/standard/fast) and let scenario routing pick the best model.
-  // Falls back to ModelAlias when no tier config exists (backward compatible).
+  // Step 2: Tier-based resolution (only for non-comma model names, backward compat)
   let tierResolution: TierResolution | null = null;
 
   if (!req.body.model.includes(",")) {
-    // 1. Try tier resolution first
     tierResolution = resolveTier(req.body.model, configService);
 
     if (tierResolution) {
       (req as any)._tierResolution = tierResolution;
       req.log.info(`Tier resolved: ${req.body.model} → tier=${tierResolution.tier}`);
-      // Do NOT set model — fall through to scenario routing below
     } else {
-      // 2. Fall back to traditional ModelAlias (backward compatible)
+      // Fall back to ModelAlias (backward compatible)
       const aliasTarget = resolveModelAlias(req.body.model, configService);
       if (aliasTarget) {
         req.log.info(`Model alias resolved: ${req.body.model} → ${aliasTarget}`);
@@ -190,8 +194,7 @@ const getUseModel = async (
     }
   }
 
-  // If model is now a fully-qualified "provider,model" string (from explicit
-  // client format, slash-prefix, or legacy ModelAlias), return immediately.
+  // Step 3: If model is "provider,model" → validate and return
   if (req.body.model.includes(",")) {
     const [provider, model] = req.body.model.split(",");
     const providerLower = provider.toLowerCase();
@@ -208,7 +211,8 @@ const getUseModel = async (
     return { model: req.body.model, scenarioType: 'default' };
   }
 
-  // if tokenCount is greater than the configured threshold, use the long context model
+  // Step 4: Config-driven scenario routing (only activates if Router config exists)
+  // Long context model
   const longContextThreshold = Router?.longContextThreshold || 60000;
   const lastUsageThreshold =
     lastUsage &&
@@ -219,29 +223,32 @@ const getUseModel = async (
     const model = resolveScenarioModel(tierResolution, 'longContext', Router?.longContext);
     if (model) {
       req.log.info(
-        `Using long context model due to token count: ${tokenCount}, threshold: ${longContextThreshold} (tier=${tierResolution?.tier || 'none'})`
+        `Long context routing: token count ${tokenCount} > threshold ${longContextThreshold}`
       );
       return { model, scenarioType: 'longContext' };
     }
   }
+
+  // Subagent model extraction
   const subagentModel = extractSubagentModel(req);
   if (subagentModel) {
     return { model: subagentModel, scenarioType: 'default' };
   }
-  // Use the background model for any Claude Haiku variant or fast tier
-  const globalRouter = configService.get("Router");
+
+  // Background model (fast tier)
   const modelName = (req.body.model || '').toLowerCase();
   const isHaikuOrFastTier = tierResolution?.tier === 'fast' ||
     modelName.includes("haiku") ||
     modelName === 'fast';
   if (isHaikuOrFastTier) {
-    const model = resolveScenarioModel(tierResolution, 'background', globalRouter?.background);
+    const model = resolveScenarioModel(tierResolution, 'background', Router?.background);
     if (model) {
-      req.log.info(`Using background model for ${req.body.model} (tier=${tierResolution?.tier || 'none'})`);
+      req.log.info(`Background model for ${req.body.model}`);
       return { model, scenarioType: 'background' };
     }
   }
-  // The priority of websearch must be higher than thinking.
+
+  // Web search model
   if (
     Array.isArray(req.body.tools) &&
     req.body.tools.some((tool: any) => tool.type?.startsWith("web_search"))
@@ -251,78 +258,17 @@ const getUseModel = async (
       return { model, scenarioType: 'webSearch' };
     }
   }
-  // if exits thinking, use the think model
+
+  // Thinking model
   if (req.body.thinking) {
     const model = resolveScenarioModel(tierResolution, 'think', Router?.think);
     if (model) {
-      req.log.info(`Using think model for ${JSON.stringify(req.body.thinking)} (tier=${tierResolution?.tier || 'none'})`);
+      req.log.info(`Think model for thinking request`);
       return { model, scenarioType: 'think' };
     }
   }
 
-  // ====================================================================
-  // TASK CLASSIFICATION + STRATEGY SELECTION
-  // Classify the request difficulty and select the optimal model
-  // using the thinking strategy system. This allows DeepSeek V4 Pro
-  // to be actively selected for complex reasoning (not just fallback).
-  // ====================================================================
-  const taskClassificationEnabled = configService.get<boolean>('taskClassification') !== false;
-  if (taskClassificationEnabled) {
-    try {
-      const lastMessage = extractLastUserMessage(req.body);
-      if (lastMessage.length > 0) {
-        const classification = classifyRequest(lastMessage, undefined, tokenCount);
-        (req as any)._taskClassification = classification;
-
-        // Tier-aware simple task downgrade: use cheaper model for simple tasks
-        if (tierResolution && classification.category === 'SIMPLE' && classification.confidence >= 0.55) {
-          const simpleModel = resolveScenarioModel(tierResolution, 'simple', undefined);
-          if (simpleModel) {
-            req.log.info(
-              `Tier downgrade: ${tierResolution.tier}/simple task ` +
-              `(score=${classification.score.toFixed(3)}) → ${simpleModel}`
-            );
-            return { model: simpleModel, scenarioType: 'strategy_selected' };
-          }
-        }
-
-        if (classification.confidence >= 0.55) {
-          const strategyManager = getThinkingStrategyManager(req.log);
-          const providers = configService.get<any[]>('providers') || [];
-          strategyManager.updateAvailableProviders(providers);
-
-          const selection = strategyManager.selectStrategy(
-            classification.tier,
-            classification.category,
-            tokenCount,
-          );
-
-
-          // Apply strategy params (thinking config, temperature, etc.)
-          req.body = strategyManager.applyParams(req.body, selection.strategy);
-
-          req.log.info(
-            `TaskClassifier: ${classification.tier}/${classification.category} ` +
-            `(score=${classification.score.toFixed(3)}, conf=${classification.confidence.toFixed(2)}) ` +
-            `→ ${selection.strategy.name} (${selection.model}) ` +
-            `reason: ${selection.reason}`
-          );
-
-          (req as any)._strategySelection = selection;
-          return { model: selection.model, scenarioType: 'strategy_selected' };
-        }
-
-        req.log.debug(
-          `TaskClassifier: ${classification.tier}/${classification.category} ` +
-          `low confidence (${classification.confidence.toFixed(2)}), skipping strategy selection`
-        );
-      }
-    } catch (e: any) {
-      req.log.debug(`TaskClassifier skipped: ${e.message}`);
-    }
-  }
-
-  // Default fallback: tier-aware or Router default
+  // Default: tier-aware or Router.default
   const defaultModel = resolveScenarioModel(tierResolution, 'default', Router?.default);
   return { model: defaultModel, scenarioType: 'default' };
 };
@@ -332,7 +278,6 @@ const extractSubagentModel = (req: any): string | undefined => {
     return undefined;
   }
 
-  // Scan all system blocks for CCR-SUBAGENT-MODEL tag (not just system[1])
   for (let i = 0; i < req.body.system.length; i++) {
     const block = req.body.system[i];
     if (typeof block?.text !== "string") continue;
@@ -341,7 +286,6 @@ const extractSubagentModel = (req: any): string | undefined => {
       /<CCR-SUBAGENT-MODEL>(.*?)<\/CCR-SUBAGENT-MODEL>/s
     );
     if (match) {
-      // Remove the tag from the system block
       req.body.system[i].text = block.text.replace(
         `<CCR-SUBAGENT-MODEL>${match[1]}</CCR-SUBAGENT-MODEL>`,
         ""
@@ -364,11 +308,7 @@ export type RouterScenarioType =
   | 'think'
   | 'longContext'
   | 'webSearch'
-  | 'reasoning_flash'
-  | 'reasoning_pro_max'
-  | 'strategy_selected'
   | 'health_fallback'
-  | 'adaptive'
   | string;
 
 export interface RouterFallbackConfig {
@@ -381,7 +321,7 @@ export interface RouterFallbackConfig {
 
 export const router = async (req: any, _res: any, context: RouterContext) => {
   const { configService, event } = context;
-  // Parse sessionId from metadata.user_id
+
   if (req.body.metadata?.user_id) {
     const parts = req.body.metadata.user_id.split("_session_");
     if (parts.length > 1) {
@@ -401,14 +341,13 @@ export const router = async (req: any, _res: any, context: RouterContext) => {
   }
 
   try {
-    // Try to get tokenizer config for the current model
-    const [providerName, modelName] = req.body.model.split(",");
+    // Token counting
+    const [providerName, modelName] = (req.body.model || '').split(",");
     const tokenizerConfig = context.tokenizerService?.getTokenizerConfigForModel(
       providerName,
       modelName
     );
 
-    // Use TokenizerService if available, otherwise fall back to legacy method
     let tokenCount: number;
 
     if (context.tokenizerService) {
@@ -422,7 +361,6 @@ export const router = async (req: any, _res: any, context: RouterContext) => {
       );
       tokenCount = result.tokenCount;
     } else {
-      // Legacy fallback
       tokenCount = calculateTokenCount(
         messages as MessageParam[],
         system,
@@ -430,6 +368,7 @@ export const router = async (req: any, _res: any, context: RouterContext) => {
       );
     }
 
+    // Custom router (external JS module, opt-in)
     let model = extractSubagentModel(req);
     const customRouterPath = configService.get("CUSTOM_ROUTER_PATH");
     if (!model && customRouterPath) {
@@ -454,125 +393,38 @@ export const router = async (req: any, _res: any, context: RouterContext) => {
         req.log.error(`failed to load custom router: ${e.message}`);
       }
     }
+
     if (!model) {
-      const result = await getUseModel(req, tokenCount, configService, lastMessageUsage);
+      const result = await resolveModel(req, tokenCount, configService, lastMessageUsage);
       model = result.model;
       req.scenarioType = result.scenarioType;
 
-      // ====================================================================
-      // REASONING-AWARE ROUTING: analyze MCP tools and adjust tier
-      // ====================================================================
-      try {
-        const reasoning = analyzeReasoning(req.body, tokenCount);
-        if (reasoning.recommendation === 'flash' && reasoning.reason) {
-          // Route simple/relay MCP tool tasks to DeepSeek Flash (cheap, fast)
-          const flashProvider = configService.get('Router')?.reasoningFlash || 'deepseek,deepseek-v4-flash';
-          req.log.info(`Reasoning: ${reasoning.reason} → routing to flash (${flashProvider})`);
-          model = flashProvider;
-          req.scenarioType = 'reasoning_flash';
-        } else if (reasoning.recommendation === 'pro_max' && reasoning.reason) {
-          // Route deep reasoning with sufficient context to DeepSeek Pro
-          const proMaxProvider = configService.get('Router')?.reasoningProMax || 'deepseek,deepseek-v4-pro';
-          req.log.info(`Reasoning: ${reasoning.reason} → routing to pro max (${proMaxProvider})`);
-          model = proMaxProvider;
-          req.scenarioType = 'reasoning_pro_max';
-        } else if (reasoning.recommendation === 'pro' && reasoning.needsDeepReasoning) {
-          // Deep reasoning task with too little context → inject project knowledge
-          const enrichment = buildContextInjection(
-            configService.get('PROJECT_ROOT') || process.cwd(),
-            req.gatewayAgentName || 'default'
-          );
-          if (enrichment && req.body.system) {
-            if (typeof req.body.system === 'string') {
-              req.body.system = enrichment + '\n' + req.body.system;
-            } else if (Array.isArray(req.body.system)) {
-              req.body.system.unshift({ type: 'text', text: enrichment });
-            }
-            req.log.info(`Reasoning: ${reasoning.reason} → injected context (${enrichment.length} chars)`);
-            (req as any)._ragInjected = true;
-          }
-        }
-      } catch (e: any) {
-        // Reasoning engine failure → fall through to default routing
-        req.log.debug(`Reasoning engine skipped: ${e.message}`);
-      }
-
-      // ====================================================================
-      // HEALTH-BASED FALLBACK: check if target provider is healthy
-      // Falls back to config-driven fallback[scenarioType] or fallback.default
-      // ====================================================================
+      // Health-based fallback (config-driven, transparent resilience)
       try {
         const [targetProvider] = model.split(",");
         const healthMonitor = configService.get("_healthMonitor");
         if (healthMonitor && targetProvider) {
           const isHealthy = await healthMonitor.checkBeforeRoute(targetProvider);
           if (!isHealthy) {
-            // Use config-driven fallback chain
             const fallbackConfig = configService.get<any>('fallback');
             const scenarioType = req.scenarioType || 'default';
             const fallbackList = fallbackConfig?.[scenarioType] || fallbackConfig?.default || [];
             const fallback = Array.isArray(fallbackList) ? fallbackList[0] : fallbackList;
             if (fallback) {
               req.log.warn(
-                `Provider ${targetProvider} is UNHEALTHY → falling back to ${fallback}`
+                `Provider ${targetProvider} UNHEALTHY → falling back to ${fallback}`
               );
               model = fallback;
               req.scenarioType = 'health_fallback';
             } else {
               req.log.warn(
-                `Provider ${targetProvider} is UNHEALTHY and no fallback configured`
+                `Provider ${targetProvider} UNHEALTHY, no fallback configured`
               );
             }
           }
         }
       } catch (e: any) {
         req.log.debug(`Health check skipped: ${e?.message}`);
-      }
-
-      // ====================================================================
-      // ADAPTIVE ROUTER SCORING: use real-time health/latency data to
-      // potentially override the model choice with a better-scoring provider
-      // ====================================================================
-      try {
-        const adaptiveR = getAdaptiveRouter();
-        if (adaptiveR) {
-          const [targetProvider] = model.split(",");
-          const candidates = (configService.get<any[]>("providers") || [])
-            .filter((p: any) => p.models && p.models.length > 0)
-            .map((p: any) => p.name);
-          if (candidates.length > 1 && targetProvider) {
-            const routeResult = adaptiveR.route(targetProvider, candidates);
-            if (routeResult.provider !== targetProvider && routeResult.provider) {
-              const targetProviderObj = (configService.get<any[]>("providers") || [])
-                .find((p: any) => p.name.toLowerCase() === routeResult.provider!.toLowerCase());
-              if (targetProviderObj?.models?.[0]) {
-                req.log.info(
-                  `AdaptiveRouter: overriding ${targetProvider} → ${routeResult.provider} (score=${routeResult.score.toFixed(2)})`
-                );
-                model = `${routeResult.provider},${targetProviderObj.models[0]}`;
-                req.scenarioType = req.scenarioType || 'adaptive';
-              }
-            }
-          }
-        }
-      } catch (e: any) {
-        req.log.debug(`AdaptiveRouter scoring skipped: ${e.message}`);
-      }
-
-      // ====================================================================
-      // ADAPTIVE PARAMETER TUNING: auto-tune max_tokens/temperature based
-      // on request complexity signals and target model characteristics
-      // ====================================================================
-      try {
-        const tuner = getAdaptiveParameterTuner();
-        const [provider, ...modelParts] = model.split(",");
-        const modelId = modelParts.join(",");
-        const params = tuner.tune(req.body, tokenCount, provider, modelId);
-        const tuned = tuner.applyTuning(req.body, params);
-        req.body = tuned;
-        (req as any)._adaptiveParams = params;
-      } catch (e: any) {
-        req.log.debug(`AdaptiveParameterTuning skipped: ${e.message}`);
       }
     } else {
       req.scenarioType = req.gatewayScenario || req.scenarioType || 'default';
@@ -587,9 +439,6 @@ export const router = async (req: any, _res: any, context: RouterContext) => {
   return;
 };
 
-// Memory cache for sessionId to project name mapping
-// null value indicates previously searched but not found
-// Uses LRU cache with max 1000 entries
 const sessionProjectCache = new LRUCache<string, string>({
   max: 1000,
 });
@@ -597,7 +446,6 @@ const sessionProjectCache = new LRUCache<string, string>({
 export const searchProjectBySession = async (
   sessionId: string
 ): Promise<string | null> => {
-  // Check cache first
   if (sessionProjectCache.has(sessionId)) {
     const result = sessionProjectCache.get(sessionId);
     if (!result || result === '') {
@@ -610,14 +458,12 @@ export const searchProjectBySession = async (
     const dir = await opendir(CLAUDE_PROJECTS_DIR);
     const folderNames: string[] = [];
 
-    // Collect all folder names
     for await (const dirent of dir) {
       if (dirent.isDirectory()) {
         folderNames.push(dirent.name);
       }
     }
 
-    // Concurrently check each project folder for sessionId.jsonl file
     const checkPromises = folderNames.map(async (folderName) => {
       const sessionFilePath = join(
         CLAUDE_PROJECTS_DIR,
@@ -628,25 +474,21 @@ export const searchProjectBySession = async (
         const fileStat = await stat(sessionFilePath);
         return fileStat.isFile() ? folderName : null;
       } catch {
-        // File does not exist, continue checking next
         return null;
       }
     });
 
     const results = await Promise.all(checkPromises);
 
-    // Return the first existing project directory name
     for (const result of results) {
       if (result) {
-        // Cache the found result
         sessionProjectCache.set(sessionId, result);
         return result;
       }
     }
 
-    // Cache not found result (null value means previously searched but not found)
     sessionProjectCache.set(sessionId, '');
-    return null; // No matching project found
+    return null;
   } catch {
     sessionProjectCache.set(sessionId, '');
     return null;

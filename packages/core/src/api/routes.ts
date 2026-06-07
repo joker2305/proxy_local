@@ -38,7 +38,6 @@ import { getProxyDiffTracker } from "@/utils/proxy-diff";
 import { getCodeExtractor } from "@/utils/code-extractor";
 import { getIntentRouter } from "@/utils/intent-router";
 import { getEmbeddingService, EmbeddingService } from "@/utils/embedding";
-import { getFinancialDataService } from "@/utils/financial-data";
 import { writeFile, mkdir } from "fs/promises";
 import { join } from "path";
 import { homedir } from "os";
@@ -1677,98 +1676,6 @@ export const registerApiRoutes = async (
     const [embA, embB] = await service.embedBatch([textA, textB]);
     if (!embA || !embB) return { similarity: null, reason: "embedding_unavailable" };
     return { similarity: EmbeddingService.cosineSimilarity(embA, embB) };
-  });
-
-  // Financial data APIs
-  fastify.get("/api/finance/quote/:symbol", async (req: any) => {
-    const service = getFinancialDataService();
-    const quote = await service.getStockQuote(req.params.symbol);
-    if (!quote) throw createApiError("Quote not found", 404, "not_found");
-    return quote;
-  });
-
-  fastify.post("/api/finance/quotes", async (req: any) => {
-    const { symbols } = req.body;
-    if (!Array.isArray(symbols)) throw createApiError("symbols array required", 400, "invalid_request");
-    const service = getFinancialDataService();
-    return await service.getStockQuotes(symbols);
-  });
-
-  fastify.get("/api/finance/indices", async () => {
-    const service = getFinancialDataService();
-    return await service.getMarketIndices();
-  });
-
-  fastify.get("/api/finance/history/:symbol", async (req: any) => {
-    const { period, interval } = req.query as any;
-    const service = getFinancialDataService();
-    return await service.getStockHistory(
-      req.params.symbol,
-      period || "1mo",
-      interval || "1d"
-    );
-  });
-
-  fastify.get("/api/finance/stats", async () => {
-    const service = getFinancialDataService();
-    return service.getStats();
-  });
-
-  fastify.post("/api/finance/enter", async (req: any) => {
-    const { type, data } = req.body;
-    if (!type || !data) throw createApiError("type and data required", 400, "invalid_request");
-    const service = getFinancialDataService();
-    return service.enterData(type, data);
-  });
-
-  fastify.get("/api/finance/entries", async (req: any) => {
-    const { type } = req.query as any;
-    const service = getFinancialDataService();
-    return service.getManualEntries(type);
-  });
-
-  fastify.delete("/api/finance/entries/:id", async (req: any) => {
-    const service = getFinancialDataService();
-    const deleted = service.deleteManualEntry(req.params.id);
-    if (!deleted) throw createApiError("Entry not found", 404, "not_found");
-    return { deleted: true };
-  });
-
-  fastify.post("/api/finance/cache/clear", async () => {
-    const service = getFinancialDataService();
-    service.clearCache();
-    return { cleared: true };
-  });
-
-  fastify.get("/api/finance/futures/contracts", async (req: any) => {
-    const { exchange } = req.query as any;
-    const service = getFinancialDataService();
-    return service.getFuturesContracts(exchange);
-  });
-
-  fastify.get("/api/finance/futures/contracts/:symbol", async (req: any) => {
-    const service = getFinancialDataService();
-    const contract = service.getFuturesContract(req.params.symbol);
-    if (!contract) throw createApiError("Contract not found", 404, "not_found");
-    return contract;
-  });
-
-  fastify.post("/api/finance/futures/margin", async (req: any) => {
-    const { symbol, price, contracts } = req.body;
-    if (!symbol || !price || !contracts) throw createApiError("symbol, price, contracts required", 400, "invalid_request");
-    const service = getFinancialDataService();
-    return service.computeMargin({ symbol, price: Number(price), contracts: Number(contracts) });
-  });
-
-  fastify.post("/api/finance/futures/risk", async (req: any) => {
-    const { symbol, position, direction, entryPrice, currentPrice } = req.body;
-    if (!symbol || !position || !direction || !entryPrice || !currentPrice)
-      throw createApiError("symbol, position, direction, entryPrice, currentPrice required", 400, "invalid_request");
-    const service = getFinancialDataService();
-    return service.computePositionRisk({
-      symbol, position: Number(position), direction,
-      entryPrice: Number(entryPrice), currentPrice: Number(currentPrice),
-    });
   });
 
   const transformersWithEndpoint =

@@ -33,7 +33,6 @@ import { TransformerService } from "./services/transformer";
 import { TokenizerService } from "./services/tokenizer";
 import { router, calculateTokenCount, searchProjectBySession } from "./utils/router";
 import { sessionUsageCache } from "./utils/cache";
-import { resolveReasoningEffort } from "./utils/thinking";
 import { MiddlewareOrchestrator } from "./middleware/orchestrator";
 import { acquireConcurrencySlots } from "./utils/concurrency";
 import { getStructuredLogger, setStructuredLogger, StructuredLogger } from "./utils/structured-logger";
@@ -290,15 +289,6 @@ class Server {
               req.provider = provider;
               req.model = model.join(",");
 
-              if (url.pathname === "/v1/messages" && provider === "deepseek") {
-                const reasoning = resolveReasoningEffort(body);
-                if (reasoning.effort) {
-                  body.output_config = { effort: reasoning.effort };
-                } else {
-                  body.output_config = { effort: this.classifyThinkingEffort(body) };
-                }
-              }
-
               const concurrencyConfig = this.configService.get('Concurrency');
               if (concurrencyConfig && provider) {
                 try {
@@ -482,35 +472,8 @@ class Server {
     }
   }
 
-  private classifyThinkingEffort(body: any): string {
-    const messages = body.messages || [];
-    const system = body.system;
-    const tools = body.tools || [];
-
-    const lastUserMsg = [...messages].reverse().find((m: any) => m.role === "user");
-    const userContent = typeof lastUserMsg?.content === "string"
-      ? lastUserMsg.content
-      : Array.isArray(lastUserMsg?.content)
-        ? lastUserMsg.content.filter((c: any) => c.type === "text").map((c: any) => c.text || "").join(" ")
-        : "";
-
-    const systemText = typeof system === "string" ? system
-      : Array.isArray(system) ? system.filter((s: any) => s.type === "text").map((s: any) => s.text || "").join(" ")
-      : "";
-
-    const hasTools = tools.length > 0;
-    const hasLongContext = messages.length > 10 || userContent.length > 2000;
-    const hasAgentPattern = systemText.includes("<CCR-SUBAGENT") || systemText.includes("agent");
-    const hasComplexQuery = userContent.length > 500 || /analyz|design|architect|implement|debug|refactor|explain/i.test(userContent);
-
-    if (hasAgentPattern || hasTools || hasLongContext || hasComplexQuery) {
-      return "max";
-    }
-    return "high";
-  }
 }
 
-// Export for external use
 export default Server;
 export { sessionUsageCache };
 export { router };
@@ -576,9 +539,6 @@ export { ReasoningChainEngine, getReasoningChainEngine, ChainStep, ChainOutput, 
 export { TrafficMirror, getTrafficMirror, TrafficMirrorConfig } from "./utils/traffic-mirror";
 export { ContextStore, getContextStore, ContextEntry, ContextQuery, ContextStoreConfig } from "./services/context-store";
 export { FallbackChainExecutor, getFallbackChainExecutor, FallbackResult, FallbackChainConfig } from "./utils/fallback-chain";
-export { RAGPipeline, getRAGPipeline, RAGDocument, RAGQueryResult, RAGPipelineConfig } from "./utils/rag-pipeline";
-export { AdaptiveParameterTuner, getAdaptiveParameterTuner, AdaptiveParams } from "./utils/adaptive-params";
-export { RateLimiterQueue, getRateLimiterQueue, RateLimiterQueueConfig } from "./utils/rate-limiter-queue";
 export { StructuredLogger, getStructuredLogger, setStructuredLogger, withLogContext, withLogContextAsync, getLogContext, LogLevel, StructuredLogEntry, LoggerConfig } from "./utils/structured-logger";
 export { RequestLifecycleLogger, LifecycleConfig } from "./utils/request-lifecycle";
 export { SecurityScanner, SecurityFinding, ScanResult } from "./utils/security-scanner";
