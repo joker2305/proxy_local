@@ -220,7 +220,7 @@ export class MiddlewareOrchestrator {
   private loadConfig(): MiddlewareConfig {
     return {
       semanticCache: {
-        enabled: this.configService.get("SEMANTIC_CACHE_ENABLED") !== false,
+        enabled: this.configService.get("SEMANTIC_CACHE_ENABLED") === true,
         ttlMs: this.configService.get("SEMANTIC_CACHE_TTL_MS") || 600000,
         maxEntries: this.configService.get("SEMANTIC_CACHE_MAX_ENTRIES") || 1000,
         similarityThreshold:
@@ -271,7 +271,7 @@ export class MiddlewareOrchestrator {
         ttlMs: this.configService.get("REASONING_CACHE_TTL_MS") || 3600000,
       },
       redisCache: {
-        enabled: this.configService.get("REDIS_ENABLED") !== false,
+        enabled: this.configService.get("REDIS_ENABLED") === true,
       },
       selfReflect: {
         enabled: this.configService.get("SELF_REFLECT_ENABLED") === true,
@@ -284,20 +284,20 @@ export class MiddlewareOrchestrator {
         enabled: this.configService.get("CACHE_WARMER_ENABLED") === true,
       },
       qualityScorer: {
-        enabled: this.configService.get("QUALITY_SCORER_ENABLED") !== false,
+        enabled: this.configService.get("QUALITY_SCORER_ENABLED") === true,
       },
       auditLogger: {
-        enabled: this.configService.get("AUDIT_LOGGER_ENABLED") !== false,
+        enabled: this.configService.get("AUDIT_LOGGER_ENABLED") === true,
       },
       slidingWindow: {
         enabled: this.configService.get("SLIDING_WINDOW_ENABLED") === true,
         maxTokens: this.configService.get("SLIDING_WINDOW_MAX_TOKENS") || 100000,
       },
       complianceDisclaimer: {
-        enabled: this.configService.get("COMPLIANCE_DISCLAIMER_ENABLED") !== false,
+        enabled: this.configService.get("COMPLIANCE_DISCLAIMER_ENABLED") === true,
       },
       cacheReport: {
-        enabled: this.configService.get("CACHE_REPORT_ENABLED") !== false,
+        enabled: this.configService.get("CACHE_REPORT_ENABLED") === true,
       },
       ollamaFallback: {
         enabled: this.configService.get("OLLAMA_FALLBACK_ENABLED") === true,
@@ -347,17 +347,17 @@ export class MiddlewareOrchestrator {
         storagePath: this.configService.get("REQUEST_REPLAY_PATH") || "./dev/replay-snapshots.jsonl",
       },
       structuredOutput: {
-        enabled: this.configService.get("STRUCTURED_OUTPUT_ENABLED") !== false,
+        enabled: this.configService.get("STRUCTURED_OUTPUT_ENABLED") === true,
       },
       abTesting: {
         enabled: this.configService.get("AB_TESTING_ENABLED") === true,
         experiments: this.configService.get("AB_TESTING_EXPERIMENTS") || {},
       },
       financialPIIMasker: {
-        enabled: this.configService.get("FINANCIAL_PII_MASKER_ENABLED") !== false,
+        enabled: this.configService.get("FINANCIAL_PII_MASKER_ENABLED") === true,
       },
       fallbackChain: {
-        enabled: this.configService.get("FALLBACK_CHAIN_ENABLED") !== false,
+        enabled: this.configService.get("FALLBACK_CHAIN_ENABLED") === true,
         maxAttempts: this.configService.get("FALLBACK_CHAIN_MAX_ATTEMPTS") || 3,
       },
       ragPipeline: {
@@ -366,7 +366,7 @@ export class MiddlewareOrchestrator {
         qdrantUrl: this.configService.get("QDRANT_URL") || "http://127.0.0.1:16333",
       },
       adaptiveParams: {
-        enabled: this.configService.get("ADAPTIVE_PARAMS_ENABLED") !== false,
+        enabled: this.configService.get("ADAPTIVE_PARAMS_ENABLED") === true,
       },
       rateLimiterQueue: {
         enabled: this.configService.get("RATE_LIMITER_QUEUE_ENABLED") === true,
@@ -380,7 +380,7 @@ export class MiddlewareOrchestrator {
         l3Enabled: this.configService.get("MULTI_LEVEL_CACHE_L3_ENABLED") === true,
       },
       securityHardener: {
-        enabled: this.configService.get("SECURITY_HARDENER_ENABLED") !== false,
+        enabled: this.configService.get("SECURITY_HARDENER_ENABLED") === true,
       },
       prometheus: {
         enabled: this.configService.get("PROMETHEUS_ENABLED") === true,
