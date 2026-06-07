@@ -54,7 +54,12 @@ export class EmbeddingService {
   }
 
   async embed(text: string): Promise<number[] | null> {
-    if (!this.available || this.config.provider === "none") return null;
+    if (!this.available || this.config.provider === "none") {
+      if (!this.available && this.config.provider !== "none") {
+        this.logger?.warn(`EmbeddingService: ${this.config.provider} unavailable at ${this.config.baseUrl}. Call /api/embedding/init to retry.`);
+      }
+      return null;
+    }
     if (!text || text.trim().length === 0) return null;
 
     const cacheKey = this.hashText(text);

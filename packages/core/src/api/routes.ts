@@ -7,6 +7,9 @@ import {
 import { RegisterProviderRequest, LLMProvider } from "@/types/llm";
 import { sendUnifiedRequest } from "@/utils/request";
 import { createApiError } from "./middleware";
+import { SSECollector } from "@/utils/sse-collector";
+import { SSEReplayer } from "@/utils/sse-replayer";
+import { generateStreamingCacheKey } from "@/utils/sse-collector";
 import { version } from "../../package.json";
 import { ConfigService } from "@/services/config";
 import { ProviderService } from "@/services/provider";
@@ -38,10 +41,10 @@ import { getProxyDiffTracker } from "@/utils/proxy-diff";
 import { getCodeExtractor } from "@/utils/code-extractor";
 import { getIntentRouter } from "@/utils/intent-router";
 import { getEmbeddingService, EmbeddingService } from "@/utils/embedding";
-import { getFinancialDataService } from "@/utils/financial-data";
 import { writeFile, mkdir } from "fs/promises";
 import { join } from "path";
 import { homedir } from "os";
+import { isPrivateIP } from "@/services/provider-registry";
 
 const SETUP_CONFIG_DIR = join(homedir(), ".claude-code-router");
 const SETUP_CONFIG_FILE = join(SETUP_CONFIG_DIR, "config.json");
@@ -119,23 +122,23 @@ async function handleTransformerEndpoint(
   // Tenant-aware rate limiting
   const tenantManager = getTenantManager();
   if (tenantManager) {
-    const tenantId = req.headers['x-tenant-id'] as string || req.headers['x-user-id'] as string;
-    if (tenantId) {
-      const tenantConfig = tenantManager.getTenantConfig(tenantId);
-      if (tenantConfig) {
-        // Check tenant-specific model allowlist
-        if (tenantConfig.modelAllowlist && tenantConfig.modelAllowlist.length > 0) {
-          const requestedModel = body.model || '';
-          const allowed = tenantConfig.modelAllowlist.some((m: string) => requestedModel.includes(m));
-          if (!allowed) {
-            throw createApiError(
-              `Model '${requestedModel}' not allowed for tenant '${tenantId}'`,
-              403,
-              "tenant_model_denied"
-            );
+      const tenantId = req.headers['x-tenant-id'] as string || req.headers['x-user-id'] as string;
+      if (tenantId) {
+        const tenantCtx = tenantManager.resolve(tenantId);
+        if (tenantCtx) {
+          const modelAllowlist = tenantCtx.allowedModels;
+          if (modelAllowlist && modelAllowlist.length > 0) {
+            const requestedModel = body.model || '';
+            const allowed = modelAllowlist.some((m: string) => requestedModel.includes(m));
+            if (!allowed) {
+              throw createApiError(
+                `Model '${requestedModel}' not allowed for tenant '${tenantId}'`,
+                403,
+                "tenant_model_denied"
+              );
+            }
           }
         }
-      }
     }
   }
 
@@ -170,7 +173,7 @@ async function handleTransformerEndpoint(
   }
 
   // Budget soft-limit warning (throttle)
-  if (budgetResult.throttle) {
+  if (budgetResult.throttleMs) {
     try {
       const wsPush = getWsPush();
       if (wsPush) {
@@ -220,6 +223,29 @@ async function handleTransformerEndpoint(
       reply.code(mockResp.statusCode);
       return mockResp.response;
     }
+  }
+
+  // Streaming cache lookup (only for streaming requests)
+  if (body.stream === true) {
+    const forceRefresh = req.headers['x-ccr-cache-force-refresh'] === 'true';
+    if (!forceRefresh) {
+      const orchestrator = (fastify as any)._server?.orchestrator;
+      if (orchestrator?.semanticCache) {
+        const cached = orchestrator.semanticCache.lookupStreaming(body, {
+          model: body.model,
+        });
+        if (cached) {
+          fastify.log.info(`StreamingCache: HIT — replaying cached response (format=${cached.format}, model=${body.model})`);
+          reply.header("Content-Type", "text/event-stream");
+          reply.header("Cache-Control", "no-cache");
+          reply.header("Connection", "keep-alive");
+          reply.header("X-CCR-Cache-Status", "HIT");
+          const replayed = SSEReplayer.replay(cached.completeResponse, cached.format);
+          return reply.send(replayed);
+        }
+      }
+    }
+    reply.header("X-CCR-Cache-Status", "MISS");
   }
 
   try {
@@ -488,13 +514,26 @@ function shouldBypassTransformers(
   transformer: any,
   body: any
 ): boolean {
-  return (
+  if (
     provider.transformer?.use?.length === 1 &&
     provider.transformer.use[0].name === transformer.name &&
     (!provider.transformer?.[body.model]?.use?.length ||
       (provider.transformer?.[body.model]?.use.length === 1 &&
         provider.transformer?.[body.model]?.use[0].name === transformer.name))
-  );
+  ) {
+    return true;
+  }
+
+  const baseUrl = (provider.api_base_url || provider.baseUrl || '').toLowerCase();
+  if (
+    transformer.name === 'Anthropic' &&
+    (baseUrl.includes('/anthropic') || baseUrl.includes('bigmodel.cn/api/anthropic')) &&
+    !provider.transformer?.use?.length
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 /**
@@ -595,6 +634,11 @@ async function sendRequestToProvider(
     async () => {
       metrics.incrementActive();
       try {
+        // Debug: check requestBody type before sending
+        if (typeof requestBody === 'string') {
+          fastify.log.warn(`[CCR-BUG] requestBody is string (${requestBody.length} chars), parsing back to object`);
+          try { requestBody = JSON.parse(requestBody); } catch {}
+        }
         const res = await sendUnifiedRequest(
           url,
           requestBody,
@@ -779,6 +823,7 @@ function parseSSEToMessage(fullPayload: string): any | null {
           if (block) {
             if (parsed.delta?.type === 'text_delta') block.text = (block.text || '') + parsed.delta.text;
             else if (parsed.delta?.type === 'thinking_delta') block.thinking = (block.thinking || '') + parsed.delta.thinking;
+            else if (parsed.delta?.type === 'signature_delta') block.signature = (block.signature || '') + parsed.delta.signature;
             else if (parsed.delta?.type === 'input_json_delta') block.input = (block.input || '') + parsed.delta.partial_json;
           }
         } else if (parsed.type === 'message_delta' && finalMessage) {
@@ -793,22 +838,22 @@ function parseSSEToMessage(fullPayload: string): any | null {
 }
 
 function formatResponse(response: any, reply: FastifyReply, body: any, req?: any, orchestrator?: any) {
-  // Set HTTP status code
   if (!response.ok) {
     reply.code(response.status);
   }
 
-  // Handle streaming response
   const isStream = body.stream === true;
   if (isStream) {
     reply.header("Content-Type", "text/event-stream");
     reply.header("Cache-Control", "no-cache");
     reply.header("Connection", "keep-alive");
 
-    if (req && orchestrator && response.body) {
+    if (req && response.body) {
       const originalStream = response.body;
       const collectedChunks: string[] = [];
       const decoder = new TextDecoder();
+      const isAnthropic = (req.url || '').includes('/v1/messages');
+      const collector = new SSECollector(isAnthropic ? 'anthropic' : 'openai');
 
       const wrappedStream = new ReadableStream({
         start(controller) {
@@ -822,13 +867,28 @@ function formatResponse(response: any, reply: FastifyReply, body: any, req?: any
                     const fullPayload = collectedChunks.join('');
                     const finalMessage = parseSSEToMessage(fullPayload);
                     if (finalMessage && !finalMessage.error) {
-                      orchestrator.onPostResponse(req, finalMessage).catch(() => {});
+                      if (orchestrator) {
+                        orchestrator.onPostResponse(req, finalMessage).catch(() => {});
+                      }
+
+                      if (orchestrator?.semanticCache) {
+                        const collected = collector.getCollected();
+                        if (collected && collected.completeResponse) {
+                          orchestrator.semanticCache.storeStreaming(
+                            body,
+                            collected,
+                            { model: (req as any).model || body.model }
+                          );
+                        }
+                      }
                     }
                   } catch {}
                   controller.close();
                   return;
                 }
-                collectedChunks.push(decoder.decode(value, { stream: true }));
+                const text = decoder.decode(value, { stream: true });
+                collectedChunks.push(text);
+                collector.feed(text);
                 controller.enqueue(value);
               }
             } catch (err) {
@@ -843,7 +903,6 @@ function formatResponse(response: any, reply: FastifyReply, body: any, req?: any
 
     return reply.send(response.body);
   } else {
-    // Handle regular JSON response
     return response.json();
   }
 }
@@ -890,9 +949,6 @@ export const registerApiRoutes = async (
       hasProviders: providers.length > 0,
       providerCount: providers.length,
       hasApiKey: apiKey.length > 0,
-      apiKeyHint: apiKey.length > 8
-        ? apiKey.slice(0, 4) + '***' + apiKey.slice(-4)
-        : (apiKey ? '***' : ''),
     };
   });
 
@@ -982,6 +1038,16 @@ export const registerApiRoutes = async (
       result[name] = breaker.getState();
     }
     return result;
+  });
+
+  // Reset a specific circuit breaker
+  fastify.post("/api/circuit-breakers/:name/reset", async (req: any) => {
+    const { getAllCircuitBreakers } = await import("@/utils/circuit-breaker");
+    const breakers = getAllCircuitBreakers();
+    const breaker = breakers.get(req.params.name);
+    if (!breaker) return { error: `Circuit breaker '${req.params.name}' not found` };
+    breaker.forceClose();
+    return { success: true, name: req.params.name, state: breaker.getState().state };
   });
 
   // Rate limiter status
@@ -1116,7 +1182,7 @@ export const registerApiRoutes = async (
   fastify.get("/api/cache-report", async () => {
     const reportAgg = getCacheReportAggregator();
     const metrics = getMetrics(fastify.log);
-    const stats = metrics.getStats();
+    const stats = metrics.getStats() as any;
     return reportAgg.generateReport({
       l1: { hits: stats.cache?.hits || 0, misses: stats.cache?.misses || 0, entries: stats.cache?.size || 0 },
       l2: { hits: stats.redis?.hits || 0, misses: stats.redis?.misses || 0, connected: !!stats.redis?.connected },
@@ -1236,7 +1302,7 @@ export const registerApiRoutes = async (
     const cacheReportAgg = getCacheReportAggregator();
     const diffTracker = getProxyDiffTracker();
 
-    const stats = metrics.getStats();
+    const stats = metrics.getStats() as any;
     const cacheReport = cacheReportAgg.generateReport({
       l1: { hits: stats.cache?.hits || 0, misses: stats.cache?.misses || 0, entries: stats.cache?.size || 0 },
       l2: { hits: stats.redis?.hits || 0, misses: stats.redis?.misses || 0, connected: !!stats.redis?.connected },
@@ -1263,10 +1329,51 @@ export const registerApiRoutes = async (
       uptime: process.uptime(),
     };
 
-    // 1. Metrics
+    let metricsStats: any = null;
     try {
       const metrics = getMetrics(fastify.log);
-      result.metrics = metrics.getStats();
+      metricsStats = metrics.getStats();
+      result.metrics = metricsStats;
+
+      // UI-compatible flat fields
+      const totalCache = (metricsStats.cache?.hits || 0) + (metricsStats.cache?.misses || 0);
+      result.requests = {
+        total: metricsStats.requests?.total || 0,
+        success: (metricsStats.requests?.total || 0) - (metricsStats.requests?.errors || 0),
+        failed: metricsStats.requests?.errors || 0,
+        trend: 0,
+      };
+      result.tokens = {
+        total: (metricsStats.tokens?.inputTotal || 0) + (metricsStats.tokens?.outputTotal || 0),
+        input: metricsStats.tokens?.inputTotal || 0,
+        output: metricsStats.tokens?.outputTotal || 0,
+        trend: 0,
+      };
+      result.cost = {
+        total: metricsStats.cost?.totalUsd || 0,
+        trend: 0,
+      };
+      result.latency = {
+        avg: metricsStats.latency?.p50 || 0,
+        p50: metricsStats.latency?.p50 || 0,
+        p99: metricsStats.latency?.p99 || 0,
+        trend: 0,
+      };
+      result.cache = {
+        hitRate: totalCache > 0 ? Math.round((metricsStats.cache.hits / totalCache) * 1000) / 10 : 0,
+        l1HitRate: 0,
+        l2HitRate: 0,
+        hits: metricsStats.cache?.hits || 0,
+        misses: metricsStats.cache?.misses || 0,
+      };
+
+      // Model token breakdown
+      const modelTokens: Array<{ name: string; tokens: number }> = [];
+      const tokensByProvider = metricsStats.tokens?.byProvider || {};
+      for (const [name, t] of Object.entries(tokensByProvider)) {
+        modelTokens.push({ name, tokens: (t as any).input + (t as any).output });
+      }
+      result.models = modelTokens;
     } catch (e: any) {
       result.metrics = { error: e.message };
     }
@@ -1283,13 +1390,18 @@ export const registerApiRoutes = async (
     try {
       const { getAllCircuitBreakers } = await import("@/utils/circuit-breaker");
       const breakers = getAllCircuitBreakers();
-      const cbResult: Record<string, any> = {};
+      const cbResult: Array<{ name: string; state: string; failures?: number; lastFailure?: string }> = [];
       for (const [name, breaker] of breakers) {
-        cbResult[name] = breaker.getState();
+        const state = breaker.getState();
+        cbResult.push({
+          name,
+          state: typeof state?.state === 'string' ? state.state.toLowerCase() : 'closed',
+          failures: state?.recentFailures ?? 0,
+        });
       }
       result.circuitBreakers = cbResult;
     } catch (e: any) {
-      result.circuitBreakers = { error: e.message };
+      result.circuitBreakers = [];
     }
 
     // 4. Rate Limiter
@@ -1304,7 +1416,7 @@ export const registerApiRoutes = async (
     try {
       const cacheReportAgg = getCacheReportAggregator();
       const metrics = getMetrics(fastify.log);
-      const stats = metrics.getStats();
+      const stats = metrics.getStats() as any;
       const report = cacheReportAgg.generateReport({
         l1: { hits: stats.cache?.hits || 0, misses: stats.cache?.misses || 0, entries: stats.cache?.size || 0 },
         l2: { hits: stats.redis?.hits || 0, misses: stats.redis?.misses || 0, connected: !!stats.redis?.connected },
@@ -1321,26 +1433,28 @@ export const registerApiRoutes = async (
     // 6. Quality Scorer
     try {
       const scorer = getQualityScorer();
-      result.quality = { enabled: true };
+      result.quality = { avgScore: 0 };
     } catch (e: any) {
-      result.quality = { error: e.message };
+      result.quality = { avgScore: 0 };
     }
 
     // 7. Providers (from health monitor)
     try {
       const orchestrator = (fastify as any)._server?.orchestrator;
+      const healthMap = metricsStats?.health || {};
       if (orchestrator?.healthMonitor) {
         result.providers = orchestrator.healthMonitor.getSummary();
       } else {
         const providers = fastify.providerService.getProviders();
         result.providers = providers.map((p: any) => ({
           name: p.name,
+          status: healthMap[p.name] === false ? 'down' : 'healthy',
           enabled: p.enabled !== false,
           models: p.models?.length || 0,
         }));
       }
     } catch (e: any) {
-      result.providers = { error: e.message };
+      result.providers = [];
     }
 
     // 8. Audit Logger
@@ -1419,6 +1533,7 @@ export const registerApiRoutes = async (
     }
 
     result.responseTimeMs = Date.now() - startTime;
+    result.middleware = result.middleware || [];
     return result;
   });
 
@@ -1601,98 +1716,6 @@ export const registerApiRoutes = async (
     const [embA, embB] = await service.embedBatch([textA, textB]);
     if (!embA || !embB) return { similarity: null, reason: "embedding_unavailable" };
     return { similarity: EmbeddingService.cosineSimilarity(embA, embB) };
-  });
-
-  // Financial data APIs
-  fastify.get("/api/finance/quote/:symbol", async (req: any) => {
-    const service = getFinancialDataService();
-    const quote = await service.getStockQuote(req.params.symbol);
-    if (!quote) throw createApiError("Quote not found", 404, "not_found");
-    return quote;
-  });
-
-  fastify.post("/api/finance/quotes", async (req: any) => {
-    const { symbols } = req.body;
-    if (!Array.isArray(symbols)) throw createApiError("symbols array required", 400, "invalid_request");
-    const service = getFinancialDataService();
-    return await service.getStockQuotes(symbols);
-  });
-
-  fastify.get("/api/finance/indices", async () => {
-    const service = getFinancialDataService();
-    return await service.getMarketIndices();
-  });
-
-  fastify.get("/api/finance/history/:symbol", async (req: any) => {
-    const { period, interval } = req.query as any;
-    const service = getFinancialDataService();
-    return await service.getStockHistory(
-      req.params.symbol,
-      period || "1mo",
-      interval || "1d"
-    );
-  });
-
-  fastify.get("/api/finance/stats", async () => {
-    const service = getFinancialDataService();
-    return service.getStats();
-  });
-
-  fastify.post("/api/finance/enter", async (req: any) => {
-    const { type, data } = req.body;
-    if (!type || !data) throw createApiError("type and data required", 400, "invalid_request");
-    const service = getFinancialDataService();
-    return service.enterData(type, data);
-  });
-
-  fastify.get("/api/finance/entries", async (req: any) => {
-    const { type } = req.query as any;
-    const service = getFinancialDataService();
-    return service.getManualEntries(type);
-  });
-
-  fastify.delete("/api/finance/entries/:id", async (req: any) => {
-    const service = getFinancialDataService();
-    const deleted = service.deleteManualEntry(req.params.id);
-    if (!deleted) throw createApiError("Entry not found", 404, "not_found");
-    return { deleted: true };
-  });
-
-  fastify.post("/api/finance/cache/clear", async () => {
-    const service = getFinancialDataService();
-    service.clearCache();
-    return { cleared: true };
-  });
-
-  fastify.get("/api/finance/futures/contracts", async (req: any) => {
-    const { exchange } = req.query as any;
-    const service = getFinancialDataService();
-    return service.getFuturesContracts(exchange);
-  });
-
-  fastify.get("/api/finance/futures/contracts/:symbol", async (req: any) => {
-    const service = getFinancialDataService();
-    const contract = service.getFuturesContract(req.params.symbol);
-    if (!contract) throw createApiError("Contract not found", 404, "not_found");
-    return contract;
-  });
-
-  fastify.post("/api/finance/futures/margin", async (req: any) => {
-    const { symbol, price, contracts } = req.body;
-    if (!symbol || !price || !contracts) throw createApiError("symbol, price, contracts required", 400, "invalid_request");
-    const service = getFinancialDataService();
-    return service.computeMargin({ symbol, price: Number(price), contracts: Number(contracts) });
-  });
-
-  fastify.post("/api/finance/futures/risk", async (req: any) => {
-    const { symbol, position, direction, entryPrice, currentPrice } = req.body;
-    if (!symbol || !position || !direction || !entryPrice || !currentPrice)
-      throw createApiError("symbol, position, direction, entryPrice, currentPrice required", 400, "invalid_request");
-    const service = getFinancialDataService();
-    return service.computePositionRisk({
-      symbol, position: Number(position), direction,
-      entryPrice: Number(entryPrice), currentPrice: Number(currentPrice),
-    });
   });
 
   const transformersWithEndpoint =
@@ -1940,31 +1963,6 @@ export const registerApiRoutes = async (
     }
   });
 
-  fastify.get('/api/cache/multilevel', async (req: any, reply: any) => {
-    try {
-      const { getMultiLevelCache } = require('../utils/multi-level-cache');
-      const cache = getMultiLevelCache(undefined, req.log);
-      reply.send(cache.getAllStats());
-    } catch (e: any) {
-      reply.code(503).send({ error: 'MultiLevelCache not available', message: e.message });
-    }
-  });
-
-  fastify.post('/api/cache/multilevel/invalidate', async (req: any, reply: any) => {
-    try {
-      const { getMultiLevelCache } = require('../utils/multi-level-cache');
-      const cache = getMultiLevelCache(undefined, req.log);
-      const { pattern } = req.body || {};
-      const result = pattern
-        ? await cache.invalidate(pattern)
-        : { l1: cache.l1.invalidate(''), l2: 0 };
-      if (!pattern) cache.l1.clear();
-      reply.send({ success: true, ...result });
-    } catch (e: any) {
-      reply.code(500).send({ error: e.message });
-    }
-  });
-
   fastify.get('/api/prometheus', async (req: any, reply: any) => {
     try {
       const { getPrometheusExporter } = require('../utils/prometheus');
@@ -1983,6 +1981,33 @@ export const registerApiRoutes = async (
       const dummyUpstream = async () => ({ content: '', inputTokens: 0, outputTokens: 0 });
       const engine = getReasoningChainEngine(dummyUpstream, req.log);
       reply.send({ templates: engine.listTemplates() });
+    } catch (e: any) {
+      reply.code(503).send({ error: e.message });
+    }
+  });
+
+  // Get detailed chain template by name
+  fastify.get('/api/chain/templates/:name', async (req: any, reply: any) => {
+    try {
+      const { getReasoningChainEngine } = require('../engines/reasoning-chain');
+      const dummyUpstream = async () => ({ content: '', inputTokens: 0, outputTokens: 0 });
+      const engine = getReasoningChainEngine(dummyUpstream, req.log);
+      const template = engine.getTemplate(req.params.name);
+      if (!template) {
+        return reply.code(404).send({ error: `Template '${req.params.name}' not found`, available: engine.listTemplates().map(t => t.name) });
+      }
+      // Serialize steps (systemPrompt functions → description)
+      const steps = template.steps.map(s => ({
+        id: s.id,
+        role: s.role,
+        model: s.model,
+        provider: s.provider,
+        maxTokens: s.maxTokens,
+        timeout: s.timeout,
+        systemPromptType: typeof s.systemPrompt === 'function' ? 'dynamic' : 'static',
+        systemPrompt: typeof s.systemPrompt === 'string' ? s.systemPrompt : undefined,
+      }));
+      reply.send({ ...template, steps });
     } catch (e: any) {
       reply.code(503).send({ error: e.message });
     }
@@ -2064,6 +2089,27 @@ export const registerApiRoutes = async (
     }
   });
 
+  // Comprehensive security scan using the SecurityScanner
+  fastify.post('/api/security/scan-diff', async (req: any, reply: any) => {
+    try {
+      const { SecurityScanner } = require('../utils/security-scanner');
+      const scanner = new SecurityScanner();
+      const { content, filePath } = req.body;
+      if (!content) {
+        return reply.code(400).send({ error: 'content body field required' });
+      }
+      const findings = scanner.scanString(content, filePath || 'uploaded-content');
+      const report = scanner.generateReport(findings, 1, 0);
+      reply.send({
+        hasLeaks: findings.length > 0,
+        findings,
+        report,
+      });
+    } catch (e: any) {
+      reply.code(500).send({ error: e.message });
+    }
+  });
+
   // =========================================================================
   // PHASE 3 ROUTES: FallbackChain, RAG Pipeline, AdaptiveParams, RateLimiter
   // =========================================================================
@@ -2097,9 +2143,27 @@ export const registerApiRoutes = async (
     try {
       const { getRAGPipeline } = require('../utils/rag-pipeline');
       const pipeline = getRAGPipeline(undefined, req.log);
-      reply.send(pipeline.getStats());
+      if (!pipeline.getStats().initialized) {
+        await pipeline.initialize();
+      }
+      const stats = pipeline.getStats();
+      reply.send({
+        available: stats.initialized === true,
+        embedding_service: stats.initialized ? `ollama/${stats.ollamaModel || 'nomic-embed-text'}` : 'disconnected',
+        vector_store: stats.initialized ? `qdrant/${stats.collection || 'ccr_rag'}` : 'disconnected',
+        collections: stats.collections || 0,
+        total_documents: stats.totalDocuments || 0,
+        ...stats,
+      });
     } catch (e: any) {
-      reply.code(503).send({ error: e.message });
+      reply.send({
+        available: false,
+        embedding_service: 'unavailable',
+        vector_store: 'unavailable',
+        collections: 0,
+        total_documents: 0,
+        error: e.message,
+      });
     }
   });
 
@@ -2107,11 +2171,12 @@ export const registerApiRoutes = async (
     try {
       const { getRAGPipeline } = require('../utils/rag-pipeline');
       const pipeline = getRAGPipeline(undefined, req.log);
-      const { content, source, tags } = req.body;
-      if (!content || !source) {
-        return reply.code(400).send({ error: 'content and source are required' });
+      if (!pipeline.getStats().initialized) await pipeline.initialize();
+      const { content, collection, source, tags } = req.body;
+      if (!content) {
+        return reply.code(400).send({ error: 'content is required' });
       }
-      const ids = await pipeline.ingestDocument({ content, source, tags: tags || [] });
+      const ids = await pipeline.ingestDocument({ content, source: source || collection || 'default', tags: tags || [] });
       reply.send({ success: true, chunks: ids.length, ids });
     } catch (e: any) {
       reply.code(500).send({ error: e.message });
@@ -2122,12 +2187,14 @@ export const registerApiRoutes = async (
     try {
       const { getRAGPipeline } = require('../utils/rag-pipeline');
       const pipeline = getRAGPipeline(undefined, req.log);
-      const { text, tags, source } = req.body;
-      if (!text) {
-        return reply.code(400).send({ error: 'text is required' });
+      if (!pipeline.getStats().initialized) await pipeline.initialize();
+      const { query, text, tags, source, limit } = req.body;
+      const searchText = query || text;
+      if (!searchText) {
+        return reply.code(400).send({ error: 'query is required' });
       }
-      const results = await pipeline.query(text, { tags, source });
-      reply.send({ results, count: results.length });
+      const results = await pipeline.query(searchText, { tags, source, limit: limit || 5 });
+      reply.send(results || []);
     } catch (e: any) {
       reply.code(500).send({ error: e.message });
     }
@@ -2252,4 +2319,18 @@ function sanitizeProvider(provider: any): any {
       : '***';
   }
   return sanitized;
+}
+
+function sanitizeProviders(providers: any[] | Record<string, any>): any {
+  if (Array.isArray(providers)) {
+    return providers.map(sanitizeProvider);
+  }
+  if (typeof providers === 'object' && providers !== null) {
+    const result: Record<string, any> = {};
+    for (const [key, value] of Object.entries(providers)) {
+      result[key] = sanitizeProvider(value);
+    }
+    return result;
+  }
+  return providers;
 }

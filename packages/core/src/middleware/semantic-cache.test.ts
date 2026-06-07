@@ -181,15 +181,23 @@ describe('SemanticCache', () => {
   });
 
   it('should skip high temperature requests in both store and lookup', async () => {
+    cache = new SemanticCache(
+      {
+        enabled: true,
+        ttlMs: 60000,
+        maxEntries: 100,
+        similarityThreshold: 0.92,
+        temperatureThreshold: 0.5,
+      },
+      mockLogger
+    );
     const body = {
       messages: [{ role: 'user', content: 'creative' }],
       temperature: 0.9,
     };
-    // shouldSkip now checks temperature, so store also skips
     cache.store(body, { content: 'result' }, { model: 'test' });
     expect(cache.getStats().totalEntries).toBe(0);
 
-    // lookup should also skip
     const result = await cache.lookup(body, {});
     expect(result).toBeNull();
   });

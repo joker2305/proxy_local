@@ -1,5 +1,6 @@
 import { createHash } from 'crypto';
 import { LRUCache } from 'lru-cache';
+import { getEmbeddingService, EmbeddingService } from './embedding';
 
 export interface CacheKey {
   model: string;
@@ -198,8 +199,7 @@ export class L2RedisCache {
     try {
       const { default: Redis } = await import('ioredis');
       this.redis = new Redis({ host, port, maxRetriesPerRequest: 1, lazyConnect: true, connectTimeout: 3000 });
-      await this.redis.ping().catch(() => { this.connected = false; });
-      this.connected = true;
+      await this.redis.ping().then(() => { this.connected = true; }).catch(() => { this.connected = false; });
     } catch {
       this.connected = false;
     }
@@ -323,6 +323,7 @@ export class MultiLevelCache {
   private l3Enabled: boolean;
   private l3QdrantUrl: string;
   private l3SemanticThreshold: number;
+  private embeddingService: EmbeddingService;
   private logger?: any;
 
   constructor(config: Partial<MultiLevelCacheConfig> = {}, logger?: any) {
@@ -332,6 +333,7 @@ export class MultiLevelCache {
     this.l3Enabled = config.l3Enabled ?? false;
     this.l3QdrantUrl = config.l3QdrantUrl || 'http://127.0.0.1:16333';
     this.l3SemanticThreshold = config.l3SemanticThreshold || 0.95;
+    this.embeddingService = getEmbeddingService(undefined, logger);
   }
 
   async initialize(redisClient?: any): Promise<void> {
@@ -395,11 +397,18 @@ export class MultiLevelCache {
     if (!key.semanticHash) return null;
 
     try {
+      // Use real embedding service instead of fake hash-based vectors
+      const vector = await this.getEmbeddingVector(key.semanticHash);
+      if (!vector) {
+        this.logger?.debug('MultiLevelCache L3: no embedding available, skipping Qdrant lookup');
+        return null;
+      }
+
       const response = await fetch(`${this.l3QdrantUrl}/collections/ccr_cache/points/search`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          vector: await this.hashToVector(key.semanticHash),
+          vector,
           limit: 1,
           score_threshold: this.l3SemanticThreshold,
           with_payload: true,
@@ -433,7 +442,9 @@ export class MultiLevelCache {
     if (!key.semanticHash) return;
 
     try {
-      const vector = await this.hashToVector(key.semanticHash);
+      const vector = await this.getEmbeddingVector(key.semanticHash);
+      if (!vector) return;
+
       await fetch(`${this.l3QdrantUrl}/collections/ccr_cache/points`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -458,13 +469,20 @@ export class MultiLevelCache {
     }
   }
 
-  private async hashToVector(hash: string): Promise<number[]> {
-    const vector: number[] = [];
-    for (let i = 0; i < 384; i++) {
-      const charCode = hash.charCodeAt(i % hash.length) || 0;
-      vector.push(Math.sin(charCode * (i + 1) * 0.1) * 0.5);
+  /**
+   * Get embedding vector from the EmbeddingService.
+   * Falls back to a deterministic hash-based vector only if embedding service is unavailable.
+   * This ensures semantic similarity matching works when Ollama is running.
+   */
+  private async getEmbeddingVector(text: string): Promise<number[] | null> {
+    // Try real embedding service first
+    if (this.embeddingService.isAvailable()) {
+      const embedding = await this.embeddingService.embed(text);
+      if (embedding) return embedding;
     }
-    return vector;
+    // No fallback - L3 semantic cache requires real embeddings to function correctly.
+    // Using fake vectors would give false matches and is worse than no cache at all.
+    return null;
   }
 }
 

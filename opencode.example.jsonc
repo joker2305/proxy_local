@@ -1,0 +1,116 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": ["AGENTS.md"],
+  "default_agent": "build",
+  "server": {
+    "port": 4097,
+    "hostname": "127.0.0.1"
+  },
+  "provider": {
+    "ccr": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "CCR Local Proxy",
+      "options": {
+        "baseURL": "http://localhost:4096/v1"
+      },
+      "models": {
+        "deepseek,deepseek-chat": { "name": "DeepSeek Chat (via CCR)" },
+        "deepseek,deepseek-reasoner": { "name": "DeepSeek Reasoner (via CCR)" },
+        "glm,glm-4-flash": { "name": "GLM-4 Flash (via CCR)" },
+        "gemini,gemini-2.5-pro": { "name": "Gemini 2.5 Pro (via CCR)" },
+        "openai,gpt-4o": { "name": "GPT-4o (via CCR)" }
+      }
+    }
+  },
+  "mcp": {
+    "ccr-semantic": {
+      "type": "remote",
+      "url": "http://localhost:4096/api/mcp",
+      "enabled": true
+    }
+  },
+  "agent": {
+    "build": {
+      "mode": "primary",
+      "description": "Default agent for CCR proxy development — full tool access",
+      "permission": {
+        "read": "allow",
+        "edit": "allow",
+        "bash": {
+          "*": "ask",
+          "pnpm *": "allow",
+          "git status*": "allow",
+          "git diff*": "allow",
+          "git log*": "allow",
+          "git add*": "allow",
+          "git commit*": "allow",
+          "npx vitest*": "allow",
+          "node *": "allow",
+          "curl *": "allow"
+        },
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "task": "allow",
+        "skill": "allow",
+        "todowrite": "allow",
+        "webfetch": "allow"
+      }
+    },
+    "plan": {
+      "mode": "primary",
+      "description": "Read-only analysis mode — explore codebase without making changes",
+      "permission": {
+        "read": "allow",
+        "edit": "deny",
+        "bash": {
+          "*": "deny",
+          "pnpm *": "allow",
+          "git status*": "allow",
+          "git diff*": "allow",
+          "git log*": "allow",
+          "npx vitest*": "allow"
+        },
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "task": "allow",
+        "skill": "allow"
+      }
+    }
+  },
+  "permission": {
+    "skill": {
+      "*": "allow"
+    },
+    "task": {
+      "protocol-compare": "allow",
+      "os-research": "allow",
+      "pipeline-tracer": "allow",
+      "provider-compat": "allow",
+      "explore": "allow",
+      "general": "allow",
+      "scout": "allow"
+    }
+  },
+  "tools": {
+    "todowrite": true,
+    "webfetch": true,
+    "websearch": false,
+    "lsp": false
+  },
+  "watcher": {
+    "ignore": [
+      "node_modules",
+      "dist",
+      ".git",
+      "local/**",
+      "dev/**",
+      "tmp-*",
+      "*.log"
+    ]
+  },
+  "compaction": {
+    "threshold": 0.8
+  }
+}

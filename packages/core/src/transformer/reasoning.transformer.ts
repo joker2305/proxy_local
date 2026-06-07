@@ -41,10 +41,13 @@ export class ReasoningTransformer implements Transformer {
     if (!this.enable) return response;
     if (response.headers.get("Content-Type")?.includes("application/json")) {
       const jsonResponse = await response.json();
-      if (jsonResponse.choices[0]?.message.reasoning_content) {
-        jsonResponse.thinking = {
-          content: jsonResponse.choices[0]?.message.reasoning_content
-        }
+      if (jsonResponse.choices?.[0]?.message?.reasoning_content) {
+        // Place thinking at the correct level: choices[0].message.thinking
+        // The Anthropic transformer reads from choice.message.thinking.content
+        jsonResponse.choices[0].message.thinking = {
+          content: jsonResponse.choices[0].message.reasoning_content
+        };
+        delete jsonResponse.choices[0].message.reasoning_content;
       }
       // Handle non-streaming response if needed
       return new Response(JSON.stringify(jsonResponse), {
@@ -86,7 +89,7 @@ export class ReasoningTransformer implements Transformer {
             line: string,
             context: {
               controller: ReadableStreamDefaultController;
-              encoder: typeof TextEncoder;
+              encoder: TextEncoder;
               reasoningContent: () => string;
               appendReasoningContent: (content: string) => void;
               isReasoningComplete: () => boolean;
@@ -95,12 +98,9 @@ export class ReasoningTransformer implements Transformer {
           ) => {
             const { controller, encoder } = context;
 
-            this.logger?.debug({ line }, `Processing reason line`);
-
             if (line.startsWith("data: ") && line.trim() !== "data: [DONE]") {
               try {
                 const data = JSON.parse(line.slice(6));
-                console.log(JSON.stringify(data))
 
                 // Extract reasoning_content from delta
                 if (data.choices?.[0]?.delta?.reasoning_content) {
@@ -221,21 +221,17 @@ export class ReasoningTransformer implements Transformer {
                     setReasoningComplete: (val) => (isReasoningComplete = val),
                   });
                 } catch (error) {
-                  console.error("Error processing line:", line, error);
                   // Pass through original line if parsing fails
                   controller.enqueue(encoder.encode(line + "\n"));
                 }
               }
             }
           } catch (error) {
-            console.error("Stream error:", error);
             controller.error(error);
           } finally {
             try {
               reader.releaseLock();
-            } catch (e) {
-              console.error("Error releasing reader lock:", e);
-            }
+            } catch {}
             controller.close();
           }
         },

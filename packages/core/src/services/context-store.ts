@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { getEmbeddingService, EmbeddingService } from '../utils/embedding';
 
 export interface ContextEntry {
   id: string;
@@ -24,7 +25,6 @@ export interface ContextStoreConfig {
   backend: 'postgres' | 'qdrant' | 'memory';
   postgresUrl?: string;
   qdrantUrl?: string;
-  embeddingEndpoint?: string;
   defaultTtlMs: number;
   maxEntries: number;
 }
@@ -32,7 +32,6 @@ export interface ContextStoreConfig {
 const DEFAULT_CONFIG: ContextStoreConfig = {
   backend: 'memory',
   qdrantUrl: 'http://127.0.0.1:16333',
-  embeddingEndpoint: 'http://localhost:11434/api/embeddings',
   defaultTtlMs: 86400000,
   maxEntries: 10000,
 };
@@ -58,12 +57,13 @@ export class ContextStore {
       expiresAt: entry.expiresAt || Date.now() + this.config.defaultTtlMs,
     };
 
-    if (!fullEntry.embedding && this.config.embeddingEndpoint) {
+    if (!fullEntry.embedding) {
       try {
-        fullEntry.embedding = await this.getEmbedding(fullEntry.content);
-      } catch {
-        // Embedding failure is non-critical
-      }
+        const service = getEmbeddingService(undefined, this.logger);
+        if (service.isAvailable()) {
+          fullEntry.embedding = (await service.embed(fullEntry.content)) || undefined;
+        }
+      } catch {}
     }
 
     this.entries.set(id, fullEntry);
@@ -115,13 +115,14 @@ export class ContextStore {
     }
 
     if (query.text && candidates.length > 0) {
+      const service = getEmbeddingService(undefined, this.logger);
       const scored = await Promise.all(
         candidates.map(async (entry) => {
           let score = 0;
-          if (entry.embedding) {
-            const queryEmbedding = await this.getEmbedding(query.text).catch(() => null);
+          if (entry.embedding && service.isAvailable()) {
+            const queryEmbedding = await service.embed(query.text).catch(() => null);
             if (queryEmbedding) {
-              score = this.cosineSimilarity(queryEmbedding, entry.embedding);
+              score = EmbeddingService.cosineSimilarity(queryEmbedding, entry.embedding);
             }
           }
           if (score === 0) {
@@ -189,36 +190,6 @@ export class ContextStore {
       .update(`${content.substring(0, 200)}:${source}:${Date.now()}`)
       .digest('hex')
       .substring(0, 16);
-  }
-
-  private async getEmbedding(text: string): Promise<number[]> {
-    const truncated = text.substring(0, 2000);
-    const response = await fetch(this.config.embeddingEndpoint!, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'nomic-embed-text', prompt: truncated }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Embedding failed: ${response.status}`);
-    }
-
-    const data = await response.json();
-    return data.embedding || [];
-  }
-
-  private cosineSimilarity(a: number[], b: number[]): number {
-    if (a.length !== b.length || a.length === 0) return 0;
-    let dotProduct = 0;
-    let normA = 0;
-    let normB = 0;
-    for (let i = 0; i < a.length; i++) {
-      dotProduct += a[i] * b[i];
-      normA += a[i] * a[i];
-      normB += b[i] * b[i];
-    }
-    const denom = Math.sqrt(normA) * Math.sqrt(normB);
-    return denom === 0 ? 0 : dotProduct / denom;
   }
 
   private evictExpired(): void {

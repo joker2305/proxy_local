@@ -40,6 +40,7 @@ export class GroqTransformer implements Transformer {
 
       const decoder = new TextDecoder();
       const encoder = new TextEncoder();
+      const logger = this.logger;
 
       let hasTextContent = false;
       let reasoningContent = "";
@@ -60,7 +61,7 @@ export class GroqTransformer implements Transformer {
 
           const processLine = (line: string, context: {
             controller: ReadableStreamDefaultController;
-            encoder: typeof TextEncoder;
+            encoder: InstanceType<typeof TextEncoder>;
             hasTextContent: () => boolean;
             setHasTextContent: (val: boolean) => void;
             reasoningContent: () => string;
@@ -133,7 +134,7 @@ export class GroqTransformer implements Transformer {
               try {
                 chunk = decoder.decode(value, { stream: true });
               } catch (decodeError) {
-                console.warn("Failed to decode chunk", decodeError);
+                logger?.warn("Failed to decode chunk", decodeError);
                 continue;
               }
 
@@ -145,7 +146,7 @@ export class GroqTransformer implements Transformer {
 
               // 如果缓冲区过大，进行处理避免内存泄漏
               if (buffer.length > 1000000) { // 1MB 限制
-                console.warn("Buffer size exceeds limit, processing partial data");
+                logger?.warn("Buffer size exceeds limit, processing partial data");
                 const lines = buffer.split("\n");
                 buffer = lines.pop() || "";
 
@@ -163,7 +164,7 @@ export class GroqTransformer implements Transformer {
                         setReasoningComplete: (val) => isReasoningComplete = val
                       });
                     } catch (error) {
-                      console.error("Error processing line:", line, error);
+                      logger?.error("Error processing line:", line, error);
                       // 如果解析失败，直接传递原始行
                       controller.enqueue(encoder.encode(line + "\n"));
                     }
@@ -191,20 +192,20 @@ export class GroqTransformer implements Transformer {
                     setReasoningComplete: (val) => isReasoningComplete = val
                   });
                 } catch (error) {
-                  console.error("Error processing line:", line, error);
-                  // 如果解析失败，直接传递原始行
+                logger?.error("Error processing line:", line, error);
+                // 如果解析失败，直接传递原始行
                   controller.enqueue(encoder.encode(line + "\n"));
                 }
               }
             }
           } catch (error) {
-            console.error("Stream error:", error);
+            logger?.error("Stream error:", error);
             controller.error(error);
           } finally {
             try {
               reader.releaseLock();
             } catch (e) {
-              console.error("Error releasing reader lock:", e);
+              logger?.error("Error releasing reader lock:", e);
             }
             controller.close();
           }

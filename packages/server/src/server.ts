@@ -1,6 +1,6 @@
-import Server, { calculateTokenCount, TokenizerService, SemanticStoreService } from "@musistudio/llms";
+import Server, { calculateTokenCount, TokenizerService, SemanticStoreService, MODEL_LIMITS, DEFAULT_MODEL_LIMITS } from "@musistudio/llms";
 import { readConfigFile, writeConfigFile, backupConfigFile } from "./utils";
-import { join } from "path";
+import path, { join } from "path";
 import fastifyStatic from "@fastify/static";
 import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, rmSync } from "fs";
 import { homedir } from "os";
@@ -111,6 +111,23 @@ export const createServer = async (config: any): Promise<any> => {
   app.post("/api/config", async (req: any, reply: any) => {
     const newConfig = req.body;
 
+    // Validate config before saving
+    try {
+      const { validateConfig } = require('@musistudio/llms');
+      if (typeof validateConfig === 'function') {
+        const issues = validateConfig(newConfig);
+        const errors = issues.filter((i: any) => i.severity === 'error');
+        if (errors.length > 0) {
+          return reply.code(400).send({
+            error: 'Config validation failed',
+            issues: errors,
+          });
+        }
+      }
+    } catch {
+      // Validation module not available, proceed
+    }
+
     // Backup existing config file if it exists
     const backupPath = await backupConfigFile();
     if (backupPath) {
@@ -121,16 +138,39 @@ export const createServer = async (config: any): Promise<any> => {
     return { success: true, message: "Config saved successfully" };
   });
 
-  // Register static file serving with caching
+  // Config validation endpoint
+  app.post("/api/config/validate", async (req: any, reply: any) => {
+    try {
+      const { validateConfig } = require('@musistudio/llms');
+      if (typeof validateConfig !== 'function') {
+        return reply.code(501).send({ error: 'Validation module not available' });
+      }
+      const issues = validateConfig(req.body);
+      return {
+        valid: issues.filter((i: any) => i.severity === 'error').length === 0,
+        issues,
+      };
+    } catch (e: any) {
+      return reply.code(500).send({ error: e.message });
+    }
+  });
+
   app.register(fastifyStatic, {
     root: join(__dirname, "..", "dist"),
     prefix: "/ui/",
-    maxAge: "1h",
+    maxAge: 0,
   });
 
-  // Redirect /ui to /ui/ for proper static file serving
   app.get("/ui", async (_: any, reply: any) => {
     return reply.redirect("/ui/");
+  });
+
+  app.setNotFoundHandler(async (req: any, reply: any) => {
+    if (req.url?.startsWith("/ui/") && !req.url.includes(".")) {
+      reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+      return reply.type("text/html").sendFile("index.html");
+    }
+    reply.code(404).send({ error: "Not Found" });
   });
 
   // Get log file list endpoint
@@ -149,7 +189,7 @@ export const createServer = async (config: any): Promise<any> => {
 
             logFiles.push({
               name: file,
-              path: filePath,
+              path: path.basename(filePath),
               size: stats.size,
               lastModified: stats.mtime.toISOString()
             });
@@ -170,15 +210,17 @@ export const createServer = async (config: any): Promise<any> => {
   // Get log content endpoint
   app.get("/api/logs", async (req: any, reply: any) => {
     try {
+      const logDir = path.resolve(join(homedir(), ".claude-code-router", "logs"));
       const filePath = (req.query as any).file as string;
       let logFilePath: string;
 
       if (filePath) {
-        // If file path is specified, use the specified path
-        logFilePath = filePath;
+        logFilePath = path.resolve(logDir, filePath);
+        if (!logFilePath.startsWith(logDir)) {
+          return reply.code(403).send({ error: 'Invalid file path' });
+        }
       } else {
-        // If file path is not specified, use default log file path
-        logFilePath = join(homedir(), ".claude-code-router", "logs", "app.log");
+        logFilePath = join(logDir, "app.log");
       }
 
       if (!existsSync(logFilePath)) {
@@ -198,15 +240,17 @@ export const createServer = async (config: any): Promise<any> => {
   // Clear log content endpoint
   app.delete("/api/logs", async (req: any, reply: any) => {
     try {
+      const logDir = path.resolve(join(homedir(), ".claude-code-router", "logs"));
       const filePath = (req.query as any).file as string;
       let logFilePath: string;
 
       if (filePath) {
-        // If file path is specified, use the specified path
-        logFilePath = filePath;
+        logFilePath = path.resolve(logDir, filePath);
+        if (!logFilePath.startsWith(logDir)) {
+          return reply.code(403).send({ error: 'Invalid file path' });
+        }
       } else {
-        // If file path is not specified, use default log file path
-        logFilePath = join(homedir(), ".claude-code-router", "logs", "app.log");
+        logFilePath = join(logDir, "app.log");
       }
 
       if (existsSync(logFilePath)) {
@@ -648,8 +692,12 @@ export const createServer = async (config: any): Promise<any> => {
   // Diagnostic: test AnthropicTransformer conversion
   app.post("/api/debug/convert", async (req: any, reply: any) => {
     try {
-      const { provider: pName } = req.body;
       const srv = getServer(app);
+      const config = srv?.configService;
+      if (!config?.get('debug')?.enabled) {
+        return reply.code(404).send({ error: 'Not found' });
+      }
+      const { provider: pName } = req.body;
       const prov = srv?.providerService.getProvider(pName);
       if (!prov) return reply.code(404).send({ error: "Provider not found" });
       const url = new URL(prov.baseUrl);
@@ -684,6 +732,454 @@ export const createServer = async (config: any): Promise<any> => {
       };
     } catch (e: any) {
       return { error: e.message, stack: e.stack?.split('\n').slice(0,3) };
+    }
+  });
+
+  // --- Provider Model Discovery ---
+  app.get("/api/providers/:providerName/discover-models", async (req: any, reply: any) => {
+    try {
+      const { providerName } = req.params;
+      const config = await readConfigFile();
+      const providers = config.Providers || config.providers || [];
+      const provider = providers.find((p: any) => p.name === providerName);
+      if (!provider) {
+        return reply.code(404).send({ error: `Provider "${providerName}" not found` });
+      }
+
+      let modelsUrl: string;
+      let authHeader: string;
+      const baseUrl = provider.api_base_url || provider.apiKey || '';
+
+      if (providerName === 'glm') {
+        modelsUrl = 'https://open.bigmodel.cn/api/paas/v4/models';
+        authHeader = `Bearer ${provider.api_key || provider.apiKey}`;
+      } else if (providerName === 'deepseek') {
+        modelsUrl = 'https://api.deepseek.com/models';
+        authHeader = `Bearer ${provider.api_key || provider.apiKey}`;
+      } else if (baseUrl.includes('localhost:11434') || baseUrl.includes('127.0.0.1:11434')) {
+        modelsUrl = 'http://localhost:11434/v1/models';
+        authHeader = '';
+      } else {
+        const url = new URL(baseUrl);
+        modelsUrl = `${url.protocol}//${url.host}/v1/models`;
+        authHeader = `Bearer ${provider.api_key || provider.apiKey}`;
+      }
+
+      const headers: Record<string, string> = { 'Accept': 'application/json' };
+      if (authHeader) headers['Authorization'] = authHeader;
+
+      const resp = await fetch(modelsUrl, { headers, signal: AbortSignal.timeout(10000) });
+      if (!resp.ok) {
+        return reply.code(502).send({ error: `Upstream returned ${resp.status}`, modelsUrl });
+      }
+      const data = await resp.json() as any;
+      const rawModels: Array<{ id: string; object?: string; owned_by?: string; created?: number }> = data.data || data.models || [];
+
+      const discovered = rawModels.map((m: any) => {
+        const limits = (MODEL_LIMITS as Record<string, any>)[m.id] || DEFAULT_MODEL_LIMITS;
+        return {
+          id: m.id,
+          owned_by: m.owned_by || providerName,
+          contextWindow: limits.contextWindow,
+          maxOutputTokens: limits.maxOutputTokens,
+          supportsThinking: limits.supportsThinking || false,
+          thinkingBudgetTokens: limits.thinkingBudgetTokens || 0,
+        };
+      });
+
+      const configured = (provider.models || []).map((id: string) => {
+        const limits = (MODEL_LIMITS as Record<string, any>)[id] || DEFAULT_MODEL_LIMITS;
+        return {
+          id,
+          owned_by: providerName,
+          contextWindow: limits.contextWindow,
+          maxOutputTokens: limits.maxOutputTokens,
+          supportsThinking: limits.supportsThinking || false,
+          thinkingBudgetTokens: limits.thinkingBudgetTokens || 0,
+          configured: true,
+        };
+      });
+
+      const configuredIds = new Set(configured.map((m: any) => m.id));
+      const newModels = discovered.filter((m: any) => !configuredIds.has(m.id));
+
+      return { provider: providerName, configured, discovered: newModels, total: configured.length + newModels.length };
+    } catch (e: any) {
+      return reply.code(500).send({ error: e.message });
+    }
+  });
+
+  app.post("/api/providers/:providerName/models", async (req: any, reply: any) => {
+    try {
+      const { providerName } = req.params;
+      const { models } = req.body;
+      if (!Array.isArray(models)) {
+        return reply.code(400).send({ error: 'models must be an array of strings' });
+      }
+      const config = await readConfigFile();
+      const providers = config.Providers || config.providers || [];
+      const idx = providers.findIndex((p: any) => p.name === providerName);
+      if (idx === -1) {
+        return reply.code(404).send({ error: `Provider "${providerName}" not found` });
+      }
+      providers[idx].models = models;
+      await writeConfigFile(config);
+      return { success: true, provider: providerName, models };
+    } catch (e: any) {
+      return reply.code(500).send({ error: e.message });
+    }
+  });
+
+  app.get("/api/model-limits", async (req: any, reply: any) => {
+    try {
+      const config = await readConfigFile();
+      const providers = config.Providers || config.providers || [];
+      const allModels: Record<string, any> = {};
+
+      for (const [id, limits] of Object.entries(MODEL_LIMITS as Record<string, any>)) {
+        allModels[id] = { ...limits, provider: 'unknown' };
+      }
+
+      for (const p of providers) {
+        for (const m of (p.models || [])) {
+          if (!allModels[m]) {
+            allModels[m] = { ...DEFAULT_MODEL_LIMITS, provider: p.name };
+          }
+          allModels[m].provider = p.name;
+        }
+      }
+
+      return { models: allModels, defaultContextWindow: DEFAULT_MODEL_LIMITS.contextWindow };
+    } catch (e: any) {
+      return { models: {}, error: e.message };
+    }
+  });
+
+  // --- Context Service API (for OpenCode plugins/MCP) ---
+  app.post("/api/context/store", async (req: any, reply: any) => {
+    try {
+      const { scope, topic, content, metadata } = req.body;
+      if (!scope || !topic || !content) {
+        return reply.status(400).send({ error: "scope, topic, and content are required" });
+      }
+      const result = await semanticStore.upsert({
+        scope: scope || "session",
+        topic,
+        content,
+        metadata,
+        depth: req.body.depth,
+        trust: req.body.trust,
+        source: req.body.source || "opencode",
+      });
+      if (!result) {
+        return reply.status(503).send({ error: "Semantic store unavailable" });
+      }
+      return { success: true, id: result.id };
+    } catch (error: any) {
+      return reply.status(500).send({ error: error.message || "Failed to store context" });
+    }
+  });
+
+  app.post("/api/context/query", async (req: any, reply: any) => {
+    try {
+      const { query, scope, topic, limit, threshold } = req.body;
+      if (!query) {
+        return reply.status(400).send({ error: "query is required" });
+      }
+      const results = await semanticStore.search(query, {
+        scope,
+        topic,
+        limit: limit || 5,
+        threshold: threshold || 0.5,
+      });
+      return { results };
+    } catch (error: any) {
+      return reply.status(500).send({ error: error.message || "Failed to query context" });
+    }
+  });
+
+  app.get("/api/context/stats", async (req: any, reply: any) => {
+    try {
+      const health = await semanticStore.healthCheck();
+      return {
+        semanticStore: health,
+        timestamp: new Date().toISOString(),
+      };
+    } catch (error: any) {
+      return { semanticStore: { connected: false, error: error.message } };
+    }
+  });
+
+  app.post("/api/context/collect", async (req: any, reply: any) => {
+    try {
+      return { success: true, message: "Context collection is automatic via proxy pipeline" };
+    } catch (error: any) {
+      return reply.status(500).send({ error: error.message });
+    }
+  });
+
+  // --- MCP-compatible endpoint for OpenCode ---
+  app.post("/api/mcp", async (req: any, reply: any) => {
+    try {
+      const { jsonrpc, method, params, id } = req.body || {};
+
+      if (jsonrpc !== "2.0") {
+        return { jsonrpc: "2.0", error: { code: -32600, message: "Invalid Request" }, id: id || null };
+      }
+
+      if (method === "notifications/initialized" || method === "initialized") {
+        return { jsonrpc: "2.0", result: {}, id };
+      }
+
+      if (method === "ping") {
+        return { jsonrpc: "2.0", result: {}, id };
+      }
+
+      if (method === "initialize") {
+        return {
+          jsonrpc: "2.0",
+          result: {
+            protocolVersion: "2024-11-05",
+            capabilities: { tools: {} },
+            serverInfo: { name: "ccr-context-service", version: "2.0.0" },
+          },
+          id,
+        };
+      }
+
+      if (method === "tools/list") {
+        return {
+          jsonrpc: "2.0",
+          result: {
+            tools: [
+              {
+                name: "semantic_search",
+                description: "Search the CCR semantic store for relevant context about the project",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    query: { type: "string", description: "Search query" },
+                    scope: { type: "string", enum: ["session", "project", "reference"], description: "Search scope" },
+                    limit: { type: "number", description: "Max results (default 5)" },
+                  },
+                  required: ["query"],
+                },
+              },
+              {
+                name: "semantic_store",
+                description: "Store context information in the CCR semantic store for future retrieval",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    scope: { type: "string", enum: ["session", "project", "reference"] },
+                    topic: { type: "string", description: "Topic/category" },
+                    content: { type: "string", description: "Content to store" },
+                  },
+                  required: ["scope", "topic", "content"],
+                },
+              },
+              {
+                name: "health_check",
+                description: "Check CCR proxy health status",
+                inputSchema: { type: "object", properties: {} },
+              },
+              {
+                name: "cache_status",
+                description: "Get CCR semantic cache status and hit/miss statistics",
+                inputSchema: { type: "object", properties: {} },
+              },
+              {
+                name: "cache_invalidate",
+                description: "Invalidate cache entries. Clears semantic cache or specific provider cache",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    provider: { type: "string", description: "Provider name to invalidate (optional, clears all if omitted)" },
+                    model: { type: "string", description: "Model name to invalidate (optional)" },
+                  },
+                },
+              },
+              {
+                name: "context_list",
+                description: "List stored context entries by scope and topic",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    scope: { type: "string", enum: ["session", "project", "reference"], description: "Filter by scope" },
+                    topic: { type: "string", description: "Filter by topic (supports partial match)" },
+                    limit: { type: "number", description: "Max results (default 10)" },
+                  },
+                },
+              },
+              {
+                name: "context_delete",
+                description: "Delete stored context entries by scope and topic",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    scope: { type: "string", description: "Scope of entries to delete" },
+                    topic: { type: "string", description: "Topic of entries to delete" },
+                  },
+                  required: ["scope", "topic"],
+                },
+              },
+            ],
+          },
+          id,
+        };
+      }
+
+      if (method === "tools/call") {
+        const toolName = params?.name;
+        const args = params?.arguments || {};
+
+        if (toolName === "semantic_search") {
+          const results = await semanticStore.search(args.query || "", {
+            scope: args.scope,
+            limit: args.limit || 5,
+          });
+          return {
+            jsonrpc: "2.0",
+            result: {
+              content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+            },
+            id,
+          };
+        }
+
+        if (toolName === "semantic_store") {
+          const result = await semanticStore.upsert({
+            scope: args.scope || "session",
+            topic: args.topic || "general",
+            content: args.content || "",
+            source: "opencode-mcp",
+          });
+          return {
+            jsonrpc: "2.0",
+            result: {
+              content: [{ type: "text", text: result ? `Stored: ${result.id}` : "Store unavailable" }],
+            },
+            id,
+          };
+        }
+
+        if (toolName === "health_check") {
+          const health = await semanticStore.healthCheck();
+          const srv = getServer(app);
+          const providers = srv?.providerService.getProviders() || [];
+          return {
+            jsonrpc: "2.0",
+            result: {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  status: "ok",
+                  providers: providers.map((p: any) => p.name),
+                  semanticStore: health,
+                }),
+              }],
+            },
+            id,
+          };
+        }
+
+        if (toolName === "cache_status") {
+          const health = await semanticStore.healthCheck();
+          let cacheStats: any = {};
+          try {
+            const srv = getServer(app);
+            const orch = (srv as any)?._server?.orchestrator;
+            if (orch?.semanticCache) {
+              cacheStats = orch.semanticCache.getStats();
+            }
+          } catch {}
+          return {
+            jsonrpc: "2.0",
+            result: {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  semanticStore: health,
+                  semanticCache: cacheStats,
+                  timestamp: new Date().toISOString(),
+                }),
+              }],
+            },
+            id,
+          };
+        }
+
+        if (toolName === "cache_invalidate") {
+          let cleared = false;
+          try {
+            const srv = getServer(app);
+            const orch = (srv as any)?._server?.orchestrator;
+            if (orch?.semanticCache) {
+              orch.semanticCache.clear();
+              cleared = true;
+            }
+          } catch {}
+          return {
+            jsonrpc: "2.0",
+            result: {
+              content: [{ type: "text", text: JSON.stringify({ success: true, cacheCleared: cleared }) }],
+            },
+            id,
+          };
+        }
+
+        if (toolName === "context_list") {
+          const results = await semanticStore.search(args.topic || "", {
+            scope: args.scope,
+            limit: args.limit || 10,
+          });
+          return {
+            jsonrpc: "2.0",
+            result: {
+              content: [{
+                type: "text",
+                text: JSON.stringify(results.map((r: any) => ({
+                  id: r.id,
+                  scope: r.scope,
+                  topic: r.topic,
+                  content: r.content?.substring(0, 200),
+                  similarity: r.similarity,
+                })), null, 2),
+              }],
+            },
+            id,
+          };
+        }
+
+        if (toolName === "context_delete") {
+          const count = await semanticStore.delete(args.scope, args.topic);
+          return {
+            jsonrpc: "2.0",
+            result: {
+              content: [{ type: "text", text: JSON.stringify({ deleted: count, scope: args.scope, topic: args.topic }) }],
+            },
+            id,
+          };
+        }
+
+        return {
+          jsonrpc: "2.0",
+          error: { code: -32601, message: `Unknown tool: ${toolName}` },
+          id,
+        };
+      }
+
+      return {
+        jsonrpc: "2.0",
+        error: { code: -32601, message: `Unknown method: ${method}` },
+        id: id || null,
+      };
+    } catch (error: any) {
+      return {
+        jsonrpc: "2.0",
+        error: { code: -32603, message: error.message },
+        id: (req.body || {}).id || null,
+      };
     }
   });
 

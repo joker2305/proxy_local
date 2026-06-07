@@ -18,6 +18,16 @@ export class GlmTransformer implements Transformer {
   async transformRequestIn(request: UnifiedChatRequest): Promise<UnifiedChatRequest> {
     const model = request.model || '';
 
+    // Echo prior thinking as reasoning_content for multi-turn reasoning context
+    // GLM models with clear_thinking: false retain reasoning across turns
+    if (isGlmThinkingModel(model) && request.messages) {
+      for (const msg of request.messages) {
+        if (msg.role === 'assistant' && msg.thinking?.content) {
+          (msg as any).reasoning_content = msg.thinking.content;
+        }
+      }
+    }
+
     if (request.max_tokens && request.max_tokens > 128000) {
       request.max_tokens = 128000;
     }
@@ -72,7 +82,7 @@ export class GlmTransformer implements Transformer {
         delete msg.reasoning_content;
 
         if (!msg.content || msg.content === "") {
-          console.log(`[GlmTransformer] reasoning-only response (${msg.thinking.content.length} chars)`);
+          // reasoning-only response - no content to forward
         }
       }
 
@@ -89,6 +99,7 @@ export class GlmTransformer implements Transformer {
       const decoder = new TextDecoder();
       const encoder = new TextEncoder();
       let buffer = "";
+      const logger = this.logger;
 
       const stream = new ReadableStream({
         async start(controller) {
@@ -181,19 +192,19 @@ export class GlmTransformer implements Transformer {
                 try {
                   processLine(line, controller, encoder);
                 } catch (error) {
-                  console.error("Error processing line:", line, error);
+                  logger?.error("Error processing line:", line, error);
                   controller.enqueue(encoder.encode(line + "\n"));
                 }
               }
             }
           } catch (error) {
-            console.error("Stream error:", error);
+            logger?.error("Stream error:", error);
             controller.error(error);
           } finally {
             try {
               reader.releaseLock();
             } catch (e) {
-              console.error("Error releasing reader lock:", e);
+              logger?.error("Error releasing reader lock:", e);
             }
             try { controller.close(); } catch {}
           }

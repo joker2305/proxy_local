@@ -40,8 +40,8 @@ export class MultiModelVoter {
     return this.config.strategy;
   }
 
-  selectWinner(results: VoteResult[]): VoteResult {
-    if (results.length === 0) throw new Error("No results to vote on");
+  selectWinner(results: VoteResult[]): VoteResult | null {
+    if (results.length === 0) return null;
     if (results.length === 1) return results[0];
 
     switch (this.config.strategy) {

@@ -4,7 +4,7 @@ import { Transformer } from "../types/transformer";
 export class TooluseTransformer implements Transformer {
   name = "tooluse";
 
-  transformRequestIn(request: UnifiedChatRequest): UnifiedChatRequest {
+  async transformRequestIn(request: UnifiedChatRequest): Promise<Record<string, any>> {
     request.messages.push({
       role: "system",
       content: `<system-reminder>Tool mode is active. The user expects you to proactively execute the most suitable tool to help complete the task. 
@@ -69,6 +69,7 @@ Examples:
       let exitToolIndex = -1;
       let exitToolResponse = "";
       let buffer = ""; // Buffer for incomplete data
+      const logger = this.logger;
 
       const stream = new ReadableStream({
         async start(controller) {
@@ -187,20 +188,20 @@ Examples:
                       (exitToolResponse += content),
                   });
                 } catch (error) {
-                  console.error("Error processing line:", line, error);
-                  // If parsing fails, pass through the original line
+                  logger?.error("Error processing line:", line, error);
+                    // If parsing fails, pass through the original line
                   controller.enqueue(encoder.encode(line + "\n"));
                 }
               }
             }
           } catch (error) {
-            console.error("Stream error:", error);
+            logger?.error("Stream error:", error);
             controller.error(error);
           } finally {
             try {
               reader.releaseLock();
             } catch (e) {
-              console.error("Error releasing reader lock:", e);
+              logger?.error("Error releasing reader lock:", e);
             }
             controller.close();
           }

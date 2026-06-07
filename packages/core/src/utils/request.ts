@@ -52,10 +52,11 @@ export function sendUnifiedRequest(
     combinedSignal = timeoutSignal;
   }
 
+  const bodyStr = typeof request === 'string' ? request : JSON.stringify(request);
   const fetchOptions: RequestInit = {
     method: "POST",
     headers: headers,
-    body: JSON.stringify(request),
+    body: bodyStr,
     signal: combinedSignal,
   };
 

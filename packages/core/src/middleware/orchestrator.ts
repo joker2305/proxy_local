@@ -41,18 +41,17 @@ import { RequestReplay, ReplayConfig } from "./request-replay";
 import { StructuredOutputEnforcer, StructuredOutputConfig } from "./structured-output";
 import { ABTestingFramework, ABTestConfig } from "./ab-testing";
 import { FinancialPIIMasker, FinancialPIIMaskerConfig } from "./financial-pii-masker";
-import { checkHallucination, analyzeReasoning } from "../engines/reasoning-engine";
+import { checkHallucination } from "../engines/reasoning-engine";
 import type { ReasoningContext } from "../engines/reasoning-engine";
-import { MultiLevelCache, getMultiLevelCache, type CacheKey } from "../utils/multi-level-cache";
 import { SecurityHardener, getSecurityHardener } from "../utils/security-hardener";
 import { PrometheusExporter, getPrometheusExporter } from "../utils/prometheus";
 import { TrafficMirror, getTrafficMirror } from "../utils/traffic-mirror";
 import { AdaptiveRouter, getAdaptiveRouter } from "../utils/adaptive-router";
 import { getRedisCache } from "../utils/redis-cache";
+import { getEmbeddingService } from "../utils/embedding";
 import { redactObject } from "../utils/redactor";
 import { getPromptTemplateEngine } from "../utils/prompt-template";
 import { getWsPush } from "../utils/ws-push";
-import { getCacheWarmer } from "../utils/cache-warmer";
 import { getTaskQueue } from "../utils/task-queue";
 import { getSelfReflector } from "../utils/self-reflect";
 import { getTenantManager } from "../utils/tenant-isolation";
@@ -91,7 +90,6 @@ export interface MiddlewareConfig {
   redisCache: { enabled: boolean };
   selfReflect: { enabled: boolean; maxIterations: number };
   wsPush: { enabled: boolean };
-  cacheWarmer: { enabled: boolean };
   qualityScorer: { enabled: boolean };
   auditLogger: { enabled: boolean };
   slidingWindow: { enabled: boolean; maxTokens: number };
@@ -110,7 +108,6 @@ export interface MiddlewareConfig {
   structuredOutput: Partial<StructuredOutputConfig>;
   abTesting: Partial<ABTestConfig>;
   financialPIIMasker: Partial<FinancialPIIMaskerConfig>;
-  multiLevelCache: { enabled: boolean; l1MaxSize: number; l2Enabled: boolean; l3Enabled: boolean };
   securityHardener: { enabled: boolean };
   prometheus: { enabled: boolean };
   trafficMirror: { enabled: boolean; targets: any[] };
@@ -143,7 +140,6 @@ export class MiddlewareOrchestrator {
   public abTesting: ABTestingFramework;
   public financialPIIMasker: FinancialPIIMasker;
   public healthMonitor: HealthMonitor | null = null;
-  public multiLevelCache: MultiLevelCache | null = null;
   public securityHardener: SecurityHardener | null = null;
   public prometheusExporter: PrometheusExporter | null = null;
   public trafficMirror: TrafficMirror | null = null;
@@ -219,7 +215,7 @@ export class MiddlewareOrchestrator {
   private loadConfig(): MiddlewareConfig {
     return {
       semanticCache: {
-        enabled: this.configService.get("SEMANTIC_CACHE_ENABLED") !== false,
+        enabled: this.configService.get("SEMANTIC_CACHE_ENABLED") === true,
         ttlMs: this.configService.get("SEMANTIC_CACHE_TTL_MS") || 600000,
         maxEntries: this.configService.get("SEMANTIC_CACHE_MAX_ENTRIES") || 1000,
         similarityThreshold:
@@ -227,13 +223,13 @@ export class MiddlewareOrchestrator {
         endpoint: this.configService.get("GPTCACHE_ENDPOINT"),
       },
       memoryBridge: {
-        enabled: this.configService.get("MEMORY_BRIDGE_ENABLED") !== false,
+        enabled: this.configService.get("MEMORY_BRIDGE_ENABLED") === true,
         storagePath: this.configService.get("MEMORY_STORAGE_PATH") || "./dev/memories.jsonl",
         extractionEnabled:
-          this.configService.get("MEMORY_EXTRACTION_ENABLED") !== false,
+          this.configService.get("MEMORY_EXTRACTION_ENABLED") === true,
       },
       ragEnricher: {
-        enabled: this.configService.get("RAG_ENRICHER_ENABLED") !== false,
+        enabled: this.configService.get("RAG_ENRICHER_ENABLED") === true,
         projectRoot: this.configService.get("PROJECT_ROOT") || process.cwd(),
         maxEnrichmentTokens:
           this.configService.get("RAG_MAX_ENRICHMENT_TOKENS") || 2000,
@@ -256,13 +252,13 @@ export class MiddlewareOrchestrator {
         vectorStoreCollection: this.configService.get("RAG_VECTOR_STORE_COLLECTION") || "rag_documents",
       },
       contextCapture: {
-        enabled: this.configService.get("CONTEXT_CAPTURE_ENABLED") !== false,
+        enabled: this.configService.get("CONTEXT_CAPTURE_ENABLED") === true,
         storageMode: this.configService.get("CONTEXT_CAPTURE_STORAGE") || "jsonl",
         postgresConnectionString: this.configService.get("PG_CONNECTION_STRING"),
         jsonlPath: this.configService.get("CONTEXT_CAPTURE_JSONL_PATH") || "./dev/captures.jsonl",
       },
       reasoningCache: {
-        enabled: this.configService.get("REASONING_CACHE_ENABLED") !== false,
+        enabled: this.configService.get("REASONING_CACHE_ENABLED") === true,
         postgresConnectionString: this.configService.get("PG_CONNECTION_STRING"),
         maxChainLength: this.configService.get("REASONING_CACHE_MAX_CHAIN_LENGTH") || 8000,
         maxResults: this.configService.get("REASONING_CACHE_MAX_RESULTS") || 3,
@@ -270,7 +266,7 @@ export class MiddlewareOrchestrator {
         ttlMs: this.configService.get("REASONING_CACHE_TTL_MS") || 3600000,
       },
       redisCache: {
-        enabled: this.configService.get("REDIS_ENABLED") !== false,
+        enabled: this.configService.get("REDIS_ENABLED") === true,
       },
       selfReflect: {
         enabled: this.configService.get("SELF_REFLECT_ENABLED") === true,
@@ -279,24 +275,21 @@ export class MiddlewareOrchestrator {
       wsPush: {
         enabled: this.configService.get("WS_PUSH_ENABLED") === true,
       },
-      cacheWarmer: {
-        enabled: this.configService.get("CACHE_WARMER_ENABLED") === true,
-      },
       qualityScorer: {
-        enabled: this.configService.get("QUALITY_SCORER_ENABLED") !== false,
+        enabled: this.configService.get("QUALITY_SCORER_ENABLED") === true,
       },
       auditLogger: {
-        enabled: this.configService.get("AUDIT_LOGGER_ENABLED") !== false,
+        enabled: this.configService.get("AUDIT_LOGGER_ENABLED") === true,
       },
       slidingWindow: {
         enabled: this.configService.get("SLIDING_WINDOW_ENABLED") === true,
         maxTokens: this.configService.get("SLIDING_WINDOW_MAX_TOKENS") || 100000,
       },
       complianceDisclaimer: {
-        enabled: this.configService.get("COMPLIANCE_DISCLAIMER_ENABLED") !== false,
+        enabled: this.configService.get("COMPLIANCE_DISCLAIMER_ENABLED") === true,
       },
       cacheReport: {
-        enabled: this.configService.get("CACHE_REPORT_ENABLED") !== false,
+        enabled: this.configService.get("CACHE_REPORT_ENABLED") === true,
       },
       ollamaFallback: {
         enabled: this.configService.get("OLLAMA_FALLBACK_ENABLED") === true,
@@ -346,17 +339,17 @@ export class MiddlewareOrchestrator {
         storagePath: this.configService.get("REQUEST_REPLAY_PATH") || "./dev/replay-snapshots.jsonl",
       },
       structuredOutput: {
-        enabled: this.configService.get("STRUCTURED_OUTPUT_ENABLED") !== false,
+        enabled: this.configService.get("STRUCTURED_OUTPUT_ENABLED") === true,
       },
       abTesting: {
         enabled: this.configService.get("AB_TESTING_ENABLED") === true,
         experiments: this.configService.get("AB_TESTING_EXPERIMENTS") || {},
       },
       financialPIIMasker: {
-        enabled: this.configService.get("FINANCIAL_PII_MASKER_ENABLED") !== false,
+        enabled: this.configService.get("FINANCIAL_PII_MASKER_ENABLED") === true,
       },
       fallbackChain: {
-        enabled: this.configService.get("FALLBACK_CHAIN_ENABLED") !== false,
+        enabled: this.configService.get("FALLBACK_CHAIN_ENABLED") === true,
         maxAttempts: this.configService.get("FALLBACK_CHAIN_MAX_ATTEMPTS") || 3,
       },
       ragPipeline: {
@@ -365,12 +358,25 @@ export class MiddlewareOrchestrator {
         qdrantUrl: this.configService.get("QDRANT_URL") || "http://127.0.0.1:16333",
       },
       adaptiveParams: {
-        enabled: this.configService.get("ADAPTIVE_PARAMS_ENABLED") !== false,
+        enabled: this.configService.get("ADAPTIVE_PARAMS_ENABLED") === true,
       },
       rateLimiterQueue: {
         enabled: this.configService.get("RATE_LIMITER_QUEUE_ENABLED") === true,
         maxConcurrent: this.configService.get("RATE_LIMITER_QUEUE_MAX_CONCURRENT") || 5,
         maxQueueSize: this.configService.get("RATE_LIMITER_QUEUE_MAX_SIZE") || 100,
+      },
+      securityHardener: {
+        enabled: this.configService.get("SECURITY_HARDENER_ENABLED") === true,
+      },
+      prometheus: {
+        enabled: this.configService.get("PROMETHEUS_ENABLED") === true,
+      },
+      trafficMirror: {
+        enabled: this.configService.get("TRAFFIC_MIRROR_ENABLED") === true,
+        targets: this.configService.get("TRAFFIC_MIRROR_TARGETS") || [],
+      },
+      adaptiveRouter: {
+        enabled: this.configService.get("ADAPTIVE_ROUTER_ENABLED") === true,
       },
     };
   }
@@ -393,6 +399,25 @@ export class MiddlewareOrchestrator {
     // Initialize reasoning cache
     await this.reasoningCache.initialize();
 
+    // Initialize embedding service (needed by SemanticCache)
+    try {
+      const embeddingProvider = this.configService.get('EMBEDDING_PROVIDER') || 'ollama';
+      const embeddingBaseUrl = this.configService.get('EMBEDDING_BASE_URL') || 'http://localhost:11434';
+      const embeddingModel = this.configService.get('EMBEDDING_MODEL') || 'nomic-embed-text';
+      const embeddingService = getEmbeddingService({
+        enabled: true,
+        provider: embeddingProvider,
+        baseUrl: embeddingBaseUrl,
+        model: embeddingModel,
+      }, this.logger);
+      const available = await embeddingService.initialize();
+      this.logger.info(
+        `  EmbeddingService: ${available ? `available (${embeddingProvider}/${embeddingModel})` : `unavailable (${embeddingProvider} at ${embeddingBaseUrl})`}`
+      );
+    } catch (e: any) {
+      this.logger.debug(`  EmbeddingService: skipped (${e?.message})`);
+    }
+
     // Initialize Redis cache L2
     try {
       const redisCache = getRedisCache();
@@ -401,16 +426,6 @@ export class MiddlewareOrchestrator {
       }
     } catch (e: any) {
       this.logger.debug(`  RedisCache L2: not available (${e?.message})`);
-    }
-
-    // Initialize cache warmer
-    try {
-      const warmer = getCacheWarmer();
-      if (warmer) {
-        this.logger.info("  CacheWarmer: available");
-      }
-    } catch (e: any) {
-      this.logger.debug(`  CacheWarmer: not available (${e?.message})`);
     }
 
     // Initialize task queue
@@ -447,14 +462,14 @@ export class MiddlewareOrchestrator {
     }
 
     if (typeof (this.idempotencyGuard as any).initialize === 'function') {
-      this.idempotencyGuard.initialize();
+      (this.idempotencyGuard as any).initialize();
     }
-    this.logger.info(`  IdempotencyGuard: ${this.idempotencyGuard['config']?.enabled ? 'enabled' : 'disabled'}`);
+    this.logger.info(`  IdempotencyGuard: ${(this.idempotencyGuard as any)['config']?.enabled ? 'enabled' : 'disabled'}`);
 
     if (typeof (this.keyManager as any).initialize === 'function') {
-      this.keyManager.initialize();
+      (this.keyManager as any).initialize();
     }
-    this.logger.info(`  KeyManager: ${this.keyManager['config']?.enabled ? 'enabled' : 'disabled'}`);
+    this.logger.info(`  KeyManager: ${(this.keyManager as any)['mgrConfig']?.enabled ? 'enabled' : 'disabled'}`);
 
     await this.qdrantCache.initialize();
     this.logger.info(`  QdrantCache: ${this.qdrantCache['config']?.enabled ? 'enabled' : 'disabled'}`);
@@ -467,22 +482,7 @@ export class MiddlewareOrchestrator {
     this.logger.info(`  ABTesting: ${this.abTesting.getStats().enabled ? 'enabled' : 'disabled'}`);
     this.logger.info(`  FinancialPIIMasker: ${this.financialPIIMasker.getStats().enabled ? 'enabled' : 'disabled'}`);
 
-    // Initialize v2 infrastructure modules
-    try {
-      const mlcConfig = this.middlewareConfig.multiLevelCache || { enabled: true, l1MaxSize: 1000, l2Enabled: true, l3Enabled: false };
-      if (mlcConfig.enabled) {
-        this.multiLevelCache = getMultiLevelCache({
-          l1: { maxSize: mlcConfig.l1MaxSize },
-          l2: { maxSize: 10000 },
-          l3Enabled: mlcConfig.l3Enabled,
-        }, this.logger);
-        await this.multiLevelCache.initialize();
-        this.logger.info(`  MultiLevelCache: L1(memory) + L2(redis:${this.multiLevelCache.l2.isConnected()}) + L3(qdrant:${mlcConfig.l3Enabled})`);
-      }
-    } catch (e: any) {
-      this.logger.debug(`  MultiLevelCache: skipped (${e?.message})`);
-    }
-
+    // Initialize security hardener
     try {
       if (this.middlewareConfig.securityHardener?.enabled !== false) {
         this.securityHardener = getSecurityHardener(undefined, this.logger);
@@ -581,9 +581,10 @@ export class MiddlewareOrchestrator {
     if (this.healthMonitor) {
       this.healthMonitor.stop();
     }
-    try { await this.reasoningCache.cleanup(); } catch {}
+    try { await this.reasoningCache.cleanup(); } catch (e: any) { this.logger?.debug(`Shutdown reasoningCache: ${e?.message}`); }
 
     this.sessionBridge.cleanup();
+    this.semanticCache.shutdown();
     this.evolutionBridge.shutdown();
     this.langfuseTracer.shutdown();
     this.idempotencyGuard.shutdown();
@@ -592,28 +593,20 @@ export class MiddlewareOrchestrator {
     // Shutdown Redis cache
     try {
       const redisCache = getRedisCache();
-      if (redisCache) await redisCache.shutdown();
-    } catch {}
+      if (redisCache && typeof (redisCache as any).shutdown === 'function') await (redisCache as any).shutdown();
+    } catch (e: any) { this.logger?.debug(`Shutdown RedisCache: ${e?.message}`); }
 
     // Shutdown task queue
     try {
       const queue = getTaskQueue();
-      if (queue) await queue.shutdown();
-    } catch {}
-
-    // Shutdown cache warmer
-    try {
-      const warmer = getCacheWarmer();
-      if (warmer) warmer.stop();
-    } catch {}
+      if (queue && typeof (queue as any).shutdown === 'function') await (queue as any).shutdown();
+    } catch (e: any) { this.logger?.debug(`Shutdown TaskQueue: ${e?.message}`); }
 
     // Shutdown WebSocket push
     try {
       const wsPush = getWsPush();
-      if (wsPush) wsPush.shutdown();
-    } catch {}
-
-    this.initialized = false;
+      if (wsPush && typeof (wsPush as any).shutdown === 'function') (wsPush as any).shutdown();
+    } catch (e: any) { this.logger?.debug(`Shutdown WsPush: ${e?.message}`); }
 
     if (this.trafficMirror) {
       this.trafficMirror.updateConfig({ enabled: false });
@@ -626,6 +619,8 @@ export class MiddlewareOrchestrator {
     if (this.securityHardener) {
       this.securityHardener.destroy();
     }
+
+    this.initialized = false;
 
     this.logger.info("MiddlewareOrchestrator: shutdown (v2)");
   }
@@ -717,8 +712,13 @@ export class MiddlewareOrchestrator {
       if (this.qdrantCache['config']?.enabled) {
         try {
           const queryText = this.extractQuerySummary(req.body);
+          let queryVector: number[] = [];
+          const embedSvc = getEmbeddingService(undefined, this.logger);
+          if (embedSvc.isAvailable()) {
+            queryVector = (await embedSvc.embed(queryText)) || [];
+          }
           const qdrantResult = await withTimeout(
-            this.qdrantCache.lookup(queryText, []),
+            this.qdrantCache.lookup(queryText, queryVector),
             150,
             null,
             "qdrantCache.lookup",
@@ -754,22 +754,21 @@ export class MiddlewareOrchestrator {
       const tokenCount = (req as any).tokenCount || 0;
       const scenarioType = (req as any).scenarioType || '';
 
-      // Gate RAG injection: skip trivial/simple flash queries only
-      // Always inject for: pro models, thinking/reasoning, named agents, or large context
       const modelId = Array.isArray((req as any).model) 
         ? (req as any).model.join(',') 
         : ((req as any).model || req.body?.model || '');
       const routeTier = (req as any).routeTier || '';
       const isProModel = modelId.includes('pro') || modelId.includes('opus') || routeTier === 'pro' || routeTier === 'pro_max';
-      const shouldEnrich = tokenCount >= 500 || 
+      const shouldEnrich = this.middlewareConfig.ragEnricher?.enabled && (
+        tokenCount >= 500 || 
         scenarioType === 'think' || 
         scenarioType === 'reasoning_pro_max' ||
         scenarioType === 'reasoning_flash' ||
         isProModel ||
-        (context.agentName && !['_default', 'unknown', 'Explore'].includes(context.agentName));
+        (context.agentName && !['_default', 'unknown', 'Explore'].includes(context.agentName))
+      );
 
       if (shouldEnrich) {
-        // Enrich system prompt with RAG context (100ms budget)
         const enrichmentResult = await withTimeout(
           this.ragEnricher.enrich(req.body.system, context),
           100,
@@ -784,32 +783,31 @@ export class MiddlewareOrchestrator {
         }
       }
 
-      // Retrieve and inject memory context (100ms budget)
-      const memories = await withTimeout(
-        this.memoryBridge.retrieve(context),
-        100,
-        [],
-        "memoryBridge.retrieve",
-        this.logger
-      );
-      if (memories.length > 0) {
-        // Append memory hints to system prompt
-        const memoryHint = [
-          "\n<memory_hints>",
-          ...memories.map((m: any, i: number) => `[${i + 1}] ${m.content || m.memory}`),
-          "</memory_hints>",
-        ].join("\n");
+      if (this.middlewareConfig.memoryBridge?.enabled) {
+        const memories = await withTimeout(
+          this.memoryBridge.retrieve(context),
+          100,
+          [],
+          "memoryBridge.retrieve",
+          this.logger
+        );
+        if (memories.length > 0) {
+          const memoryHint = [
+            "\n<memory_hints>",
+            ...memories.map((m: any, i: number) => `[${i + 1}] ${m.content || m.memory}`),
+            "</memory_hints>",
+          ].join("\n");
 
-        if (typeof req.body.system === "string") {
-          req.body.system += memoryHint;
-        } else if (Array.isArray(req.body.system)) {
-          req.body.system.push({ type: "text", text: memoryHint });
+          if (typeof req.body.system === "string") {
+            req.body.system += memoryHint;
+          } else if (Array.isArray(req.body.system)) {
+            req.body.system.push({ type: "text", text: memoryHint });
+          }
+          (req as any)._memoryEnriched = true;
         }
-        (req as any)._memoryEnriched = true;
       }
 
-      // Retrieve reasoning hints for think/reasoning scenarios
-      if (scenarioType === 'think' || scenarioType === 'reasoning_pro_max' || isProModel) {
+      if (this.middlewareConfig.reasoningCache?.enabled && (scenarioType === 'think' || scenarioType === 'reasoning_pro_max' || isProModel)) {
         const query = this.extractQuerySummary(req.body);
         const chains = await withTimeout(
           this.reasoningCache.retrieve(query),
@@ -829,17 +827,15 @@ export class MiddlewareOrchestrator {
         }
       }
 
-      // Execute onRouteDecision hooks
       const hookCtx = this.hookManager.createContext(req);
       hookCtx.tokenCount = (req as any).tokenCount;
       hookCtx.scenarioType = (req as any).scenarioType;
       await this.hookManager.execute("onRouteDecision", hookCtx);
 
-      // Apply prompt template injection (if configured)
       try {
         const promptEngine = getPromptTemplateEngine();
         if (promptEngine) {
-          const templateResult = promptEngine.processSystemPrompt(
+          const processedSystem = promptEngine.processSystemPrompt(
             req.body.system,
             {
               sessionId: context.sessionId,
@@ -848,8 +844,8 @@ export class MiddlewareOrchestrator {
               model: (req as any).model || req.body?.model,
             }
           );
-          if (templateResult.modified) {
-            req.body.system = templateResult.prompt;
+          if (processedSystem !== req.body.system) {
+            req.body.system = processedSystem;
             (req as any)._templateApplied = true;
           }
         }
@@ -857,38 +853,8 @@ export class MiddlewareOrchestrator {
         this.logger.debug(`PromptTemplate failed: ${e?.message}`);
       }
 
-      // Apply compliance disclaimer for financial queries
-      try {
-        const disclaimer = getComplianceDisclaimer();
-        if (disclaimer) {
-          const result = disclaimer.process(req.body);
-          if (result.modified) {
-            req.body = result.body;
-            (req as any)._complianceDisclaimer = true;
-          }
-        }
-      } catch (e: any) {
-        this.logger.debug(`ComplianceDisclaimer failed: ${e?.message}`);
-      }
-
       if (this.promptCaching['config']?.enabled !== false) {
         req.body = this.promptCaching.injectCacheControl(req.body);
-      }
-
-      if (this.financialPIIMasker.getStats().enabled) {
-        const maskResult = this.financialPIIMasker.maskBody(req.body);
-        if (maskResult.masked) {
-          req.body = maskResult.body;
-          (req as any)._piiMasked = maskResult.maskedCount;
-        }
-      }
-
-      if (this.abTesting.getStats().enabled) {
-        const sessionId = context.sessionId || "default";
-        const abVariant = this.abTesting.assignVariant(sessionId, "default");
-        if (abVariant) {
-          (req as any)._abVariant = abVariant;
-        }
       }
 
       if (this.summaryInjector['config']?.enabled && this.summaryInjector.shouldCompact(req.body)) {
@@ -900,50 +866,50 @@ export class MiddlewareOrchestrator {
         }
       }
 
-      // SessionBridge: process request for compaction detection and context preservation
-      try {
-        const sessionResult = this.sessionBridge.processRequest(
-          context.sessionId || "unknown",
-          req.body
-        );
-        if (sessionResult.isCompaction) {
-          (req as any)._compactionDetected = true;
-          this.logger?.info(`SessionBridge: compaction detected for ${context.sessionId}`);
-        }
-        if (sessionResult.preservedContextToInject.length > 0) {
-          const preservedHint = [
-            "\n<preserved_context>",
-            ...sessionResult.preservedContextToInject.map(c => `[${c.source}] ${c.value}`),
-            "</preserved_context>",
-          ].join("\n");
-          if (typeof req.body.system === "string") {
-            req.body.system += preservedHint;
-          } else if (Array.isArray(req.body.system)) {
-            req.body.system.push({ type: "text", text: preservedHint });
+      if (this.middlewareConfig.contextCapture?.enabled) {
+        try {
+          const sessionResult = this.sessionBridge.processRequest(
+            context.sessionId || "unknown",
+            req.body
+          );
+          if (sessionResult.isCompaction) {
+            (req as any)._compactionDetected = true;
+            this.logger?.info(`SessionBridge: compaction detected for ${context.sessionId}`);
           }
-          (req as any)._contextPreserved = true;
-        }
-      } catch (e: any) {
-        this.logger.debug(`SessionBridge request processing failed: ${e?.message}`);
-      }
-
-      // EvolutionBridge: detect skills and inject evolution context
-      try {
-        const skills = this.evolutionBridge.detectSkills(req.body);
-        if (skills.length > 0) {
-          (req as any)._detectedSkills = skills;
-
-          const evolutionContext = this.evolutionBridge.buildContextInjection(skills);
-          if (evolutionContext && typeof req.body.system === "string") {
-            req.body.system += "\n" + evolutionContext;
-            (req as any)._evolutionEnriched = true;
-          } else if (evolutionContext && Array.isArray(req.body.system)) {
-            req.body.system.push({ type: "text", text: evolutionContext });
-            (req as any)._evolutionEnriched = true;
+          if (sessionResult.preservedContextToInject.length > 0) {
+            const preservedHint = [
+              "\n<preserved_context>",
+              ...sessionResult.preservedContextToInject.map(c => `[${c.source}] ${c.value}`),
+              "</preserved_context>",
+            ].join("\n");
+            if (typeof req.body.system === "string") {
+              req.body.system += preservedHint;
+            } else if (Array.isArray(req.body.system)) {
+              req.body.system.push({ type: "text", text: preservedHint });
+            }
+            (req as any)._contextPreserved = true;
           }
+        } catch (e: any) {
+          this.logger.debug(`SessionBridge request processing failed: ${e?.message}`);
         }
-      } catch (e: any) {
-        this.logger.debug(`EvolutionBridge skill detection failed: ${e?.message}`);
+
+        try {
+          const skills = this.evolutionBridge.detectSkills(req.body);
+          if (skills.length > 0) {
+            (req as any)._detectedSkills = skills;
+
+            const evolutionContext = this.evolutionBridge.buildContextInjection(skills);
+            if (evolutionContext && typeof req.body.system === "string") {
+              req.body.system += "\n" + evolutionContext;
+              (req as any)._evolutionEnriched = true;
+            } else if (evolutionContext && Array.isArray(req.body.system)) {
+              req.body.system.push({ type: "text", text: evolutionContext });
+              (req as any)._evolutionEnriched = true;
+            }
+          }
+        } catch (e: any) {
+          this.logger.debug(`EvolutionBridge skill detection failed: ${e?.message}`);
+        }
       }
 
     } catch (error: any) {
@@ -969,8 +935,6 @@ export class MiddlewareOrchestrator {
           taskType: context.taskType,
           model: (req as any).body?.model || "unknown",
           tokenCount: (req as any).tokenCount,
-        }).catch((err) => {
-          this.logger?.debug(`SemanticCache store failed: ${err?.message}`);
         });
 
         // L2 Redis cache store (fire-and-forget)
@@ -990,7 +954,12 @@ export class MiddlewareOrchestrator {
 
         if (this.qdrantCache['config']?.enabled) {
           const queryText = this.extractQuerySummary(req.body);
-          this.qdrantCache.store(queryText, [], responseBody, {
+          let storeVector: number[] = [];
+          const embedSvc = getEmbeddingService(undefined, this.logger);
+          if (embedSvc.isAvailable()) {
+            storeVector = (await embedSvc.embed(queryText).catch(() => null)) || [];
+          }
+          this.qdrantCache.store(queryText, storeVector, responseBody, {
             model: (req as any).model || 'unknown',
             provider: (req as any).provider || 'unknown',
             sessionId: context.sessionId,
@@ -1013,7 +982,7 @@ export class MiddlewareOrchestrator {
         }
       }
 
-      if (this.keyManager['config']?.enabled) {
+      if (this.keyManager['mgrConfig']?.enabled) {
         const provider = (req as any).provider;
         const statusCode = (req as any)._httpStatus || 200;
         const usedKey = (req as any)._usedApiKey;
@@ -1026,14 +995,15 @@ export class MiddlewareOrchestrator {
         }
       }
 
-      // Extract memories from conversation (fire-and-forget, don't await)
-      this.memoryBridge.extractFromConversation(
-        req.body,
-        responseBody,
-        context
-      ).catch((err: any) => {
-        this.logger?.debug(`Memory extraction failed: ${err?.message}`);
-      });
+      if (this.middlewareConfig.memoryBridge?.enabled) {
+        this.memoryBridge.extractFromConversation(
+          req.body,
+          responseBody,
+          context
+        ).catch((err: any) => {
+          this.logger?.debug(`Memory extraction failed: ${err?.message}`);
+        });
+      }
 
       // Capture full context for HSE/SkillClaw (fire-and-forget)
       const usage = responseBody?.usage || {};
@@ -1064,27 +1034,29 @@ export class MiddlewareOrchestrator {
       try {
         redactedBody = redactObject(req.body);
         redactedResponse = redactObject(responseBody);
-      } catch {}
+      } catch (e: any) { this.logger.debug(`onPostResponse redact failed: ${e?.message}`); }
 
-      this.contextCapture.capture({
-        sessionId: context.sessionId,
-        agentType: (req as any).gatewayAgentName || detectAgentFromReq(req),
-        modelTier: (req as any).routeTier || 'unknown',
-        provider: (req as any).provider || 'unknown',
-        modelId: (req as any).model || 'unknown',
-        tokenCount: (req as any).tokenCount,
-        requestBody: redactedBody,
-        responseBody: redactedResponse,
-        usage,
-        startTime: (req as any)._startTime,
-        endTime: Date.now(),
-        scenarioType: (req as any).scenarioType || 'unknown',
-        hallucinationRisk: reasoningCtx.hallucinationRisk,
-        cacheHit: !!(req as any)._cacheHit,
-        ragEnriched: !!(req as any)._ragEnriched,
-      }).catch((err) => {
-        this.logger?.warn(`Context capture failed: ${err?.message}`);
-      });
+      if (this.middlewareConfig.contextCapture?.enabled) {
+        this.contextCapture.capture({
+          sessionId: context.sessionId,
+          agentType: (req as any).gatewayAgentName || detectAgentFromReq(req),
+          modelTier: (req as any).routeTier || 'unknown',
+          provider: (req as any).provider || 'unknown',
+          modelId: (req as any).model || 'unknown',
+          tokenCount: (req as any).tokenCount,
+          requestBody: redactedBody,
+          responseBody: redactedResponse,
+          usage,
+          startTime: (req as any)._startTime,
+          endTime: Date.now(),
+          scenarioType: (req as any).scenarioType || 'unknown',
+          hallucinationRisk: reasoningCtx.hallucinationRisk,
+          cacheHit: !!(req as any)._cacheHit,
+          ragEnriched: !!(req as any)._ragEnriched,
+        }).catch((err) => {
+          this.logger?.warn(`Context capture failed: ${err?.message}`);
+        });
+      }
 
       // WebSocket push for high hallucination risk
       if (reasoningCtx.hallucinationRisk > 0.5) {
@@ -1100,7 +1072,7 @@ export class MiddlewareOrchestrator {
               model: (req as any).model,
             });
           }
-        } catch {}
+        } catch (e: any) { this.logger.debug(`onPostResponse ws-push/hallucination failed: ${e?.message}`); }
       }
 
       // Self-reflection loop (if enabled, for non-streaming responses)
@@ -1179,10 +1151,10 @@ export class MiddlewareOrchestrator {
                   responseSummary: responseText.slice(0, 200),
                 });
               }
-            } catch {}
-          }).catch(() => {});
+            } catch (e: any) { this.logger.debug(`onPostResponse quality audit failed: ${e?.message}`); }
+          }).catch((e: any) => { this.logger.debug(`onPostResponse quality audit async failed: ${e?.message}`); });
         }
-      } catch {}
+      } catch (e: any) { this.logger.debug(`onPostResponse reasoning analysis failed: ${e?.message}`); }
 
       // SessionBridge: process response for tool chain tracking
       try {
@@ -1279,7 +1251,7 @@ export class MiddlewareOrchestrator {
           (req as any).provider || 'unknown',
           (req as any).model || 'unknown',
           responseBody
-        ).catch(() => {});
+        ).catch((e: any) => { this.logger.debug(`TrafficMirror failed: ${e?.message}`); });
       }
 
       // v2: Security audit entry
@@ -1331,7 +1303,7 @@ export class MiddlewareOrchestrator {
             scenarioType: (req as any).scenarioType,
           });
         }
-      } catch {}
+      } catch (e: any) { this.logger.debug(`onError metrics/reporting failed: ${e?.message}`); }
     } catch (e: any) {
       this.logger?.error(`MiddlewareOrchestrator onError hook failed: ${e?.message}`);
     }
@@ -1367,6 +1339,22 @@ export class MiddlewareOrchestrator {
     hooks: Record<string, number>;
     health: { name: string; healthy: boolean; latency: number }[];
     redis: { connected: boolean; hits: number; misses: number };
+    langfuse?: any;
+    toolCompressor?: any;
+    idempotency?: any;
+    keyManager?: any;
+    qdrantCache?: any;
+    cacheReport?: any;
+    v2?: {
+      securityHardener?: any;
+      prometheus?: any;
+      trafficMirror?: any;
+      adaptiveRouter?: any;
+      fallbackChain?: any;
+      ragPipeline?: any;
+      adaptiveParams?: any;
+      rateLimiterQueue?: any;
+    };
   } {
     let redisStats = { connected: false, hits: 0, misses: 0 };
     try {
@@ -1375,7 +1363,7 @@ export class MiddlewareOrchestrator {
         const stats = redisCache.getStats();
         redisStats = { connected: true, ...stats };
       }
-    } catch {}
+    } catch (e: any) { this.logger.debug(`getSummary RedisCache stats failed: ${e?.message}`); }
 
     return {
       cache: this.semanticCache.getStats(),
@@ -1398,11 +1386,10 @@ export class MiddlewareOrchestrator {
               l2: redisStats,
             });
           }
-        } catch {}
+        } catch (e: any) { this.logger.debug(`getSummary cache report failed: ${e?.message}`); }
         return null;
       })(),
       v2: {
-        multiLevelCache: this.multiLevelCache?.getAllStats() || null,
         securityHardener: this.securityHardener ? { enabled: true } : null,
         prometheus: this.prometheusExporter ? { enabled: true } : null,
         trafficMirror: this.trafficMirror?.getComparisonStats() || null,

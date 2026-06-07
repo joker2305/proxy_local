@@ -130,11 +130,15 @@ export class RequestReplay {
   }
 
   private sanitize(obj: any): any {
-    const str = JSON.stringify(obj);
-    if (str.length > 100000) {
-      return JSON.parse(str.slice(0, 100000));
+    try {
+      const str = JSON.stringify(obj);
+      if (str.length > 100000) {
+        return JSON.parse(str.slice(0, 100000));
+      }
+      return obj;
+    } catch {
+      return { truncated: true };
     }
-    return obj;
   }
 
   private extractText(response: any): string {

@@ -17,6 +17,8 @@
 import { EventEmitter } from "events";
 import { createHash } from "crypto";
 import { getEmbeddingService, EmbeddingService } from "../utils/embedding";
+import type { CollectedSSE } from "../utils/sse-collector";
+import { generateStreamingCacheKey } from "../utils/sse-collector";
 export interface CacheConfig {
   enabled: boolean;
   endpoint?: string;
@@ -33,8 +35,8 @@ const DEFAULT_CONFIG: CacheConfig = {
   ttlMs: 600000,
   similarityThreshold: 0.92,
   maxEntries: 1000,
-  skipPatterns: ["stream"],
-  temperatureThreshold: 0.5,
+  skipPatterns: [],
+  temperatureThreshold: 0.99,
   useEmbedding: true,
 };
 
@@ -43,6 +45,10 @@ interface CacheEntry {
   requestHash: string;
   requestSummary: string;
   response: any;
+  streamingData?: {
+    format: "openai" | "anthropic" | "unknown";
+    completeResponse: any;
+  };
   model: string;
   tokenCount: number;
   createdAt: number;
@@ -64,8 +70,18 @@ export class SemanticCache extends EventEmitter {
     this.embeddingService = getEmbeddingService(undefined, logger);
 
     // Periodic cleanup of expired entries
-    setInterval(() => this.cleanup(), 60000);
+    this._cleanupTimer = setInterval(() => this.cleanup(), 60000) as any;
   }
+
+  shutdown(): void {
+    if (this._cleanupTimer) {
+      clearInterval(this._cleanupTimer as any);
+      this._cleanupTimer = null;
+    }
+    this.cache.clear();
+  }
+
+  private _cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   /**
    * Check if request has a cached response.
@@ -75,6 +91,7 @@ export class SemanticCache extends EventEmitter {
     sessionId?: string;
     agentName?: string;
     taskType?: string;
+    model?: string;
   }): Promise<any | null> {
     if (!this.enabled) return null;
 
@@ -201,6 +218,109 @@ export class SemanticCache extends EventEmitter {
   }
 
   /**
+   * Store a streaming response in cache.
+   * Called after SSE collection completes.
+   */
+  storeStreaming(
+    requestBody: any,
+    collected: CollectedSSE,
+    context: {
+      sessionId?: string;
+      agentName?: string;
+      taskType?: string;
+      model?: string;
+    }
+  ): void {
+    if (!this.enabled) return;
+    if (!collected.completeResponse) return;
+
+    const cacheKey = generateStreamingCacheKey(requestBody, context.model);
+    const requestHash = this.generateRequestHash(requestBody);
+
+    const entry: CacheEntry = {
+      key: cacheKey,
+      requestHash,
+      requestSummary: this.extractRequestSummary(requestBody),
+      response: collected.completeResponse,
+      streamingData: {
+        format: collected.format,
+        completeResponse: collected.completeResponse,
+      },
+      model: context.model || collected.model || "unknown",
+      tokenCount:
+        (collected.usage?.input_tokens || 0) +
+        (collected.usage?.output_tokens || 0),
+      createdAt: Date.now(),
+      expiresAt: Date.now() + this.config.ttlMs,
+      hitCount: 0,
+    };
+
+    if (this.config.useEmbedding && this.embeddingService.isAvailable()) {
+      this.embeddingService
+        .embed(entry.requestSummary)
+        .then((emb) => {
+          if (emb) entry.embedding = emb;
+        })
+        .catch(() => {});
+    }
+
+    this.cache.set(cacheKey, entry);
+
+    if (this.cache.size > this.config.maxEntries) {
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey) this.cache.delete(oldestKey);
+    }
+
+    this.logger?.debug(
+      `SemanticCache: STORED STREAMING (key=${cacheKey}, format=${collected.format}, model=${entry.model})`
+    );
+    this.emit("cache:stored", { key: cacheKey, model: entry.model, streaming: true });
+  }
+
+  /**
+   * Lookup a streaming response from cache.
+   * Returns the cached complete response + format for SSE replay, or null.
+   */
+  lookupStreaming(
+    requestBody: any,
+    context: {
+      sessionId?: string;
+      agentName?: string;
+      taskType?: string;
+      model?: string;
+    }
+  ): { completeResponse: any; format: "openai" | "anthropic" | "unknown" } | null {
+    if (!this.enabled) return null;
+
+    try {
+      const cacheKey = generateStreamingCacheKey(requestBody, context.model);
+
+      const localEntry = this.cache.get(cacheKey);
+      if (localEntry && localEntry.expiresAt > Date.now() && localEntry.streamingData) {
+        localEntry.hitCount++;
+        this.logger?.info(
+          `SemanticCache: STREAMING HIT (hits=${localEntry.hitCount}, format=${localEntry.streamingData.format}, model=${localEntry.model})`
+        );
+        this.emit("cache:hit", {
+          key: cacheKey,
+          model: localEntry.model,
+          hitCount: localEntry.hitCount,
+          matchType: "streaming_exact",
+        });
+        return {
+          completeResponse: localEntry.streamingData.completeResponse,
+          format: localEntry.streamingData.format,
+        };
+      }
+
+      return null;
+    } catch (error: any) {
+      this.logger?.warn(`SemanticCache streaming lookup error: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
    * Clear all cached entries.
    */
   clear(): void {
@@ -285,9 +405,6 @@ export class SemanticCache extends EventEmitter {
 
   private shouldSkip(body: any): boolean {
     if (!body) return true;
-    // Skip streaming requests
-    if (body.stream === true) return true;
-    // Skip high temperature requests (non-deterministic)
     if (body.temperature > this.config.temperatureThreshold) return true;
     return false;
   }

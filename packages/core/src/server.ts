@@ -33,9 +33,10 @@ import { TransformerService } from "./services/transformer";
 import { TokenizerService } from "./services/tokenizer";
 import { router, calculateTokenCount, searchProjectBySession } from "./utils/router";
 import { sessionUsageCache } from "./utils/cache";
-import { resolveReasoningEffort } from "./utils/thinking";
 import { MiddlewareOrchestrator } from "./middleware/orchestrator";
-import { acquireConcurrencySlots, releaseWhenResponseCompletes } from "./utils/concurrency";
+import { acquireConcurrencySlots } from "./utils/concurrency";
+import { getStructuredLogger, setStructuredLogger, StructuredLogger } from "./utils/structured-logger";
+import { RequestLifecycleLogger } from "./utils/request-lifecycle";
 
 // Extend FastifyRequest to include custom properties
 declare module "fastify" {
@@ -88,6 +89,36 @@ function createApp(options: FastifyServerOptions = {}): FastifyInstance {
 }
 
 // Server class
+function sanitizeOrphanedToolMessages(body: any): void {
+  if (!body?.messages || !Array.isArray(body.messages)) return;
+
+  const cleaned: any[] = [];
+  for (let i = 0; i < body.messages.length; i++) {
+    const msg = body.messages[i];
+
+    if (msg.role === 'tool') {
+      let hasMatchingToolCall = false;
+      for (let j = i - 1; j >= 0; j--) {
+        const prev = body.messages[j];
+        if (prev.role === 'assistant' && Array.isArray(prev.tool_calls)) {
+          hasMatchingToolCall = prev.tool_calls.some(
+            (tc: any) => tc.id === msg.tool_call_id
+          );
+          if (hasMatchingToolCall) break;
+        }
+        if (prev.role === 'user') break;
+      }
+      if (!hasMatchingToolCall) continue;
+    }
+
+    cleaned.push(msg);
+  }
+
+  if (cleaned.length !== body.messages.length) {
+    body.messages = cleaned;
+  }
+}
+
 class Server {
   private app: FastifyInstance;
   configService: ConfigService;
@@ -170,6 +201,118 @@ class Server {
         fastify.decorate('transformerService', this.transformerService);
         fastify.decorate('providerService', this.providerService);
         fastify.decorate('tokenizerService', this.tokenizerService);
+
+        // Register router preHandler hook INSIDE the plugin scope
+        // so it applies to /v1/messages route registered by registerApiRoutes
+        fastify.addHook("preHandler", (req: any, reply: any, done: any) => {
+          const url = new URL(`http://127.0.0.1${req.url}`);
+          const isLLMEndpoint = url.pathname === "/v1/messages" || url.pathname === "/v1/chat/completions";
+          if (isLLMEndpoint && req.body) {
+            const body = req.body as any;
+            req.log.info({ data: body, type: "request body" });
+            if (!body.stream) {
+              body.stream = false;
+            }
+
+            if (url.pathname === "/v1/messages") {
+              if (!body.model || typeof body.model !== 'string') {
+                return reply.code(400).send({
+                  type: "error",
+                  error: { type: "invalid_request_error", message: "model: Required field is missing" },
+                });
+              }
+              if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
+                return reply.code(400).send({
+                  type: "error",
+                  error: { type: "invalid_request_error", message: "messages: Required field is missing" },
+                });
+              }
+            }
+            if (url.pathname === "/v1/chat/completions") {
+              if (!body.model || typeof body.model !== 'string') {
+                return reply.code(400).send({
+                  error: { message: "model is required", type: "invalid_request_error", code: "invalid_request" },
+                });
+              }
+              if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
+                return reply.code(400).send({
+                  error: { message: "messages is required and must be a non-empty array", type: "invalid_request_error", code: "invalid_request" },
+                });
+              }
+            }
+            sanitizeOrphanedToolMessages(body);
+          }
+          done();
+        });
+
+        fastify.addHook("preHandler", async (req: any, reply: any) => {
+          const url = new URL(`http://127.0.0.1${req.url}`);
+          const isLLMEndpoint = url.pathname === "/v1/messages" || url.pathname === "/v1/chat/completions";
+          if (isLLMEndpoint && req.body) {
+            try {
+              const body = req.body as any;
+
+              if (url.pathname === "/v1/chat/completions" && !body.system) {
+                const systemParts: Array<{ type: string; text: string }> = [];
+                for (const msg of (body.messages || [])) {
+                  if (msg.role === 'system') {
+                    const text = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+                    systemParts.push({ type: 'text', text });
+                  }
+                }
+                if (systemParts.length > 0) {
+                  body.system = systemParts;
+                }
+              }
+
+              await router(req, reply, {
+                configService: this.configService,
+                tokenizerService: this.tokenizerService,
+              });
+
+              if (reply.sent) {
+                return;
+              }
+              const routedBody = req.body as any;
+              if (!routedBody || !routedBody.model) {
+                return reply
+                  .code(400)
+                  .send({ error: "Missing model in request body" });
+              }
+              const [provider, ...model] = routedBody.model.split(",");
+              if (!provider || model.length === 0) {
+                return reply
+                  .code(400)
+                  .send({ error: `Invalid model format: ${routedBody.model}` });
+              }
+              routedBody.model = model.join(",");
+              req.provider = provider;
+              req.model = model.join(",");
+
+              const concurrencyConfig = this.configService.get('Concurrency');
+              if (concurrencyConfig && provider) {
+                try {
+                  const release = await acquireConcurrencySlots(provider, concurrencyConfig);
+                  req._releaseConcurrency = release;
+                } catch (err: any) {
+                  req.log.warn(`Concurrency limit reached for ${provider}: ${err.message}`);
+                  return reply.code(429).send({
+                    type: "error",
+                    error: {
+                      type: "rate_limit_error",
+                      message: `Too many concurrent requests to ${provider}. Please retry later.`
+                    }
+                  });
+                }
+              }
+              return;
+            } catch (err) {
+              req.log.error({error: err}, "Error in modelProviderMiddleware:");
+              return reply.code(500).send({ error: "Internal server error" });
+            }
+          }
+        });
+
         await registerApiRoutes(fastify);
       });
       return
@@ -219,94 +362,43 @@ class Server {
     try {
       this.app._server = this;
 
+      // Initialize structured logger with config-driven settings
+      const structuredLogger = new StructuredLogger({
+        level: this.configService.get('LOG_LEVEL') || 'info',
+        json: this.configService.get('LOG_FORMAT') !== 'text',
+        redactSensitive: true,
+      });
+      setStructuredLogger(structuredLogger);
+
+      // Register request lifecycle logging hooks
+      const lifecycleLogger = new RequestLifecycleLogger({
+        enabled: this.configService.get('LIFECYCLE_LOGGING_ENABLED') !== false,
+        includeTokens: true,
+        includeCost: true,
+      });
+      lifecycleLogger.register(this.app);
+
       // Initialize middleware orchestrator
       await this.orchestrator.initialize().catch((e: any) => {
         this.app.log.warn(`MiddlewareOrchestrator init skipped: ${e.message}`);
       });
 
-      this.app.addHook("preHandler", (req, reply, done) => {
-        const url = new URL(`http://127.0.0.1${req.url}`);
-        if (url.pathname === "/v1/messages" && req.body) {
-          const body = req.body as any;
-          req.log.info({ data: body, type: "request body" });
-          if (!body.stream) {
-            body.stream = false;
-          }
-        }
-        done();
-      });
-
       await this._initPromise;
+
+      // Register namespace — router hooks are INSIDE registerNamespace
+      // to avoid Fastify plugin encapsulation issues
       await this.registerNamespace('/')
-
-      this.app.addHook(
-        "preHandler",
-        async (req: FastifyRequest, reply: FastifyReply) => {
-          const url = new URL(`http://127.0.0.1${req.url}`);
-          if (url.pathname === "/v1/messages" && req.body) {
-            try {
-              const body = req.body as any;
-
-              await router(req as any, reply, {
-                configService: this.configService,
-                tokenizerService: this.tokenizerService,
-              });
-
-              if (reply.sent) return;
-              if (!body || !body.model) {
-                return reply
-                  .code(400)
-                  .send({ error: "Missing model in request body" });
-              }
-              const [provider, ...model] = body.model.split(",");
-              body.model = model.join(",");
-              req.provider = provider;
-              req.model = model.join(",");
-
-              if (provider === "deepseek") {
-                const reasoning = resolveReasoningEffort(body);
-                if (reasoning.effort) {
-                  body.output_config = { effort: reasoning.effort };
-                } else {
-                  body.output_config = { effort: this.classifyThinkingEffort(body) };
-                }
-              }
-
-              const concurrencyConfig = this.configService.get('Concurrency');
-              if (concurrencyConfig && provider) {
-                try {
-                  const release = await acquireConcurrencySlots(provider, concurrencyConfig);
-                  (req as any)._releaseConcurrency = release;
-                } catch (err: any) {
-                  req.log.warn(`Concurrency limit reached for ${provider}: ${err.message}`);
-                  return reply.code(429).send({
-                    type: "error",
-                    error: {
-                      type: "rate_limit_error",
-                      message: `Too many concurrent requests to ${provider}. Please retry later.`
-                    }
-                  });
-                }
-              }
-              return;
-            } catch (err) {
-              req.log.error({error: err}, "Error in modelProviderMiddleware:");
-              return reply.code(500).send({ error: "Internal server error" });
-            }
-          }
-        }
-      );
 
       // Orchestrator post-route hook (RAG enrichment + memory injection)
       this.app.addHook("preHandler", async (req: any) => {
-        if (req.provider && req.scenarioType) {
-          await this.orchestrator.onPostRoute(req).catch(() => {});
-        }
+        if ((req as any)._orchestrated || !req.provider || !req.scenarioType) return;
+        (req as any)._orchestrated = true;
+        await this.orchestrator.onPostRoute(req).catch(() => {});
       });
 
-      // Orchestrator post-response hook (cache store + context capture + memory extraction)
       this.app.addHook("onSend", async (req: any, reply: any, payload: any) => {
-        if (req.url?.includes("/v1/messages") && payload) {
+        const isLLMEndpoint = req.url?.includes("/v1/messages") || req.url?.includes("/v1/chat/completions");
+        if (isLLMEndpoint && payload) {
           try {
             if (typeof payload !== "string") return payload;
             const isSSE = payload.startsWith('event:') || payload.startsWith('data:');
@@ -327,7 +419,8 @@ class Server {
 
       // Orchestrator session start/end tracking
       this.app.addHook("onRequest", async (req: any) => {
-        if (req.url?.startsWith("/v1/messages")) {
+        const isLLMEndpoint = req.url?.startsWith("/v1/messages") || req.url?.startsWith("/v1/chat/completions");
+        if (isLLMEndpoint) {
           req._startTime = Date.now();
         }
       });
@@ -336,12 +429,19 @@ class Server {
         if (!req._releaseConcurrency) return;
         const release = req._releaseConcurrency;
         delete req._releaseConcurrency;
+        let released = false;
+        const safeRelease = () => {
+          if (!released) {
+            released = true;
+            release();
+          }
+        };
         const raw = reply.raw;
         if (raw && !raw.writableEnded && !raw.finished) {
-          raw.once("close", () => release());
-          raw.once("error", () => release());
+          raw.once("close", () => safeRelease());
+          raw.once("error", () => safeRelease());
         } else {
-          release();
+          safeRelease();
         }
       });
 
@@ -365,41 +465,15 @@ class Server {
 
       process.on("SIGINT", () => shutdown("SIGINT"));
       process.on("SIGTERM", () => shutdown("SIGTERM"));
-    } catch (error) {
-      this.app.log.error(`Error starting server: ${error}`);
+    } catch (error: any) {
+      console.error(`Error starting server: ${error?.message || error}`);
+      console.error(error?.stack);
       process.exit(1);
     }
   }
 
-  private classifyThinkingEffort(body: any): string {
-    const messages = body.messages || [];
-    const system = body.system;
-    const tools = body.tools || [];
-
-    const lastUserMsg = [...messages].reverse().find((m: any) => m.role === "user");
-    const userContent = typeof lastUserMsg?.content === "string"
-      ? lastUserMsg.content
-      : Array.isArray(lastUserMsg?.content)
-        ? lastUserMsg.content.filter((c: any) => c.type === "text").map((c: any) => c.text || "").join(" ")
-        : "";
-
-    const systemText = typeof system === "string" ? system
-      : Array.isArray(system) ? system.filter((s: any) => s.type === "text").map((s: any) => s.text || "").join(" ")
-      : "";
-
-    const hasTools = tools.length > 0;
-    const hasLongContext = messages.length > 10 || userContent.length > 2000;
-    const hasAgentPattern = systemText.includes("<CCR-SUBAGENT") || systemText.includes("agent");
-    const hasComplexQuery = userContent.length > 500 || /analyz|design|architect|implement|debug|refactor|explain/i.test(userContent);
-
-    if (hasAgentPattern || hasTools || hasLongContext || hasComplexQuery) {
-      return "max";
-    }
-    return "high";
-  }
 }
 
-// Export for external use
 export default Server;
 export { sessionUsageCache };
 export { router };
@@ -411,6 +485,7 @@ export { ProviderService } from "./services/provider";
 export { TransformerService } from "./services/transformer";
 export { TokenizerService } from "./services/tokenizer";
 export { SemanticStoreService } from "./services/semantic-store";
+export { generateCcrConfig } from "./services/config-generator";
 export { MiddlewareOrchestrator } from "./middleware/orchestrator";
 export { ReasoningCache } from "./middleware/reasoning-cache";
 export { pluginManager, tokenSpeedPlugin, getTokenSpeedStats, getGlobalTokenSpeedStats, CCRPlugin, CCRPluginOptions, PluginMetadata } from "./plugins";
@@ -418,6 +493,7 @@ export { SSEParserTransform, SSESerializerTransform, rewriteStream } from "./uti
 export { getCircuitBreaker, getAllCircuitBreakers, CircuitState, CircuitBreaker } from "./utils/circuit-breaker";
 export { withRetry, getRetryConfig, RetryConfig, RetryContext } from "./utils/retry";
 export { getMetrics, MetricsRegistry, MODEL_COST_TABLE } from "./utils/metrics";
+export { getModelLimits, MODEL_LIMITS, DEFAULT_MODEL_LIMITS, ModelLimits } from "./utils/model-limits";
 export { getRateLimiter, RateLimiter, RateLimiterConfig } from "./utils/rate-limiter";
 export { redactString, redactObject, containsSensitiveInfo, RedactorConfig } from "./utils/redactor";
 export { getBudgetManager, BudgetManager, BudgetConfig, BudgetAlert } from "./utils/budget";
@@ -463,6 +539,7 @@ export { ReasoningChainEngine, getReasoningChainEngine, ChainStep, ChainOutput, 
 export { TrafficMirror, getTrafficMirror, TrafficMirrorConfig } from "./utils/traffic-mirror";
 export { ContextStore, getContextStore, ContextEntry, ContextQuery, ContextStoreConfig } from "./services/context-store";
 export { FallbackChainExecutor, getFallbackChainExecutor, FallbackResult, FallbackChainConfig } from "./utils/fallback-chain";
-export { RAGPipeline, getRAGPipeline, RAGDocument, RAGQueryResult, RAGPipelineConfig } from "./utils/rag-pipeline";
-export { AdaptiveParameterTuner, getAdaptiveParameterTuner, AdaptiveParams } from "./utils/adaptive-params";
-export { RateLimiterQueue, getRateLimiterQueue, RateLimiterQueueConfig } from "./utils/rate-limiter-queue";
+export { StructuredLogger, getStructuredLogger, setStructuredLogger, withLogContext, withLogContextAsync, getLogContext, LogLevel, StructuredLogEntry, LoggerConfig } from "./utils/structured-logger";
+export { RequestLifecycleLogger, LifecycleConfig } from "./utils/request-lifecycle";
+export { SecurityScanner, SecurityFinding, ScanResult } from "./utils/security-scanner";
+export { validateConfig, ValidationError } from "./services/config-generator";
