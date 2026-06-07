@@ -38,7 +38,7 @@ docs/            → Docusaurus site
 |---------|------|
 | Core server setup | `packages/core/src/server.ts` |
 | Request routing | `packages/core/src/utils/router.ts` |
-| HTTP route handler | `packages/core/src/api/routes.ts` (2414 lines) |
+| HTTP route handler | `packages/core/src/api/routes.ts` (~2320 lines) |
 | Transformer registry | `packages/core/src/transformer/index.ts` |
 | Server app layer | `packages/server/src/server.ts` |
 | CLI entry | `packages/cli/src/cli.ts` |
@@ -244,3 +244,51 @@ Fixed 3 protocol gaps:
 - **Orphaned tool messages** (gap #8): `sanitizeOrphanedToolMessages()` removes tool messages with no matching `tool_call_id` in preceding assistant messages, preventing 400 errors from upstream providers.
 
 **Remaining gaps**: #4 (usage in message_start), #5 (synthetic signatures), #7 (header validation), #9 (schema normalization)
+
+### Round 9 Context — Transparent Proxy Simplification for OpenCode
+
+**Problem**: CCR had accumulated "smart" routing features (task classification, thinking strategy, adaptive router, adaptive params, reasoning-aware routing with context injection) that overlapped with OpenCode's own provider/routing system. Additionally, financial data APIs were completely out of scope for an LLM proxy.
+
+**OpenCode Architecture Research** (key findings):
+- OpenCode has its own LLM routing layer (`packages/llm`) with Protocol/Route/Endpoint patterns
+- 75+ built-in providers via AI SDK + Models.dev
+- Plugin system with 20+ hooks (`chat.headers`, `chat.params`, `tool.execute.before/after`, `experimental.session.compacting`)
+- MCP integration (local/remote), SDK (`@opencode-ai/sdk`), extensive community plugins
+- Model ID format: `provider/model-id` (slash), vs CCR's `provider,model` (comma)
+
+**Changes made** (commit 9f2d04f):
+
+1. **router.ts** (net -220 lines): Removed all "smart" routing that overlapped with OpenCode:
+   - Task classification + strategy selection → OpenCode decides models
+   - Thinking strategy manager → OpenCode decides thinking params
+   - Adaptive router scoring → OpenCode's provider system handles provider selection
+   - Adaptive parameter tuning → OpenCode handles max_tokens/temperature
+   - Reasoning-aware routing with context injection → RAG belongs in OpenCode plugins, not proxy
+   - Kept: slash-prefix routing, model alias, tier resolution (backward compat), config-driven scenario routing, health-based fallback
+   - Routing now deterministic: `provider,model` → parse → validate → health check → done
+
+2. **server.ts** (net -40 lines): Removed provider-specific logic from server core:
+   - `classifyThinkingEffort()` heuristic method removed
+   - DeepSeek-specific reasoning effort logic removed from preHandler
+   - Unused imports removed (resolveReasoningEffort, thinking)
+   - RAG pipeline and adaptive params exports removed
+
+3. **routes.ts** (net -93 lines): Removed out-of-scope APIs:
+   - All financial data endpoints (`/api/finance/*`) removed
+   - `getFinancialDataService` import removed
+
+**CCR Design Principle (established)**:
+CCR is a **transparent proxy and context service** for OpenCode. It should NOT make routing or parameter decisions that override OpenCode's own provider/model system. The router only:
+1. Parses model format (`provider,model`)
+2. Supports slash-prefix convenience (`openai/gpt-4`)
+3. Supports model alias (backward compat with Claude Code configs)
+4. Supports config-driven scenario routing (opt-in via Router config)
+5. Supports config-driven health fallback (transparent resilience)
+
+**Remaining work for future rounds**:
+- Make orchestrator middleware truly opt-in (MemoryBridge, RAGEnricher, ContextCapture, etc. all require `=== true`)
+- Split routes.ts into separate files (routes/index.ts, routes/providers.ts, routes/metrics.ts)
+- Consider moving remaining enterprise features (tenant isolation, AB testing, traffic mirror) to optional plugins
+- Add OpenCode plugin that provides CCR routing capabilities via OpenCode's own plugin hooks
+- Evaluate which OpenCode plugin hooks (`chat.headers`, `chat.params`, `experimental.session.compacting`) can be used for CCR integration
+- Consider `opencode-llm-proxy` pattern (OpenCode SDK → providers) as alternative approach
